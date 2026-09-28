@@ -1,0 +1,33 @@
+# systemd unit for the site monitor.
+# Install (see README "Deploy with systemd"):
+#   sudo cp deploy/site-monitor.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now site-monitor
+#   journalctl -u site-monitor -f
+
+[Unit]
+Description=Website and VPS monitor (checks, diagnosis, alerts, dashboard)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=sitemonitor
+Group=sitemonitor
+WorkingDirectory=/opt/site-monitor
+ExecStart=/opt/site-monitor/.venv/bin/python monitor.py --config /opt/site-monitor/config.yaml run
+Restart=always
+RestartSec=10
+TimeoutStopSec=20
+
+# Hardening: the monitor only needs to write its data and logs.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/site-monitor/data /opt/site-monitor/logs
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

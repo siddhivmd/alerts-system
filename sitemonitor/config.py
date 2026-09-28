@@ -1,0 +1,313 @@
+"""Load and validate configuration.
+
+Non-secret settings live in ``config.yaml``. Secrets are read only from the
+environment (typically populated from a ``.env`` file next to the config):
+
+    SMTP_PASSWORD, TELEGRAM_BOT_TOKEN, DASHBOARD_PASSWORD, SSH_KEY_PASSPHRASE
+"""
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+import yaml
+from dotenv import load_dotenv
+
+
+class ConfigError(ValueError):
+    """Raised when the configuration is missing or invalid."""
+
+
+@dataclass
+class SiteConfig:
+    """One monitored website or portal."""
+
+    name: str
+    url: str
+    keyword: str = ""
+    forbidden_keywords: list[str] = field(default_factory=list)
+    timeout: float = 15.0
+    expected_status: list[int] | None = None  # None -> any status < 400 is fine
+    headers: dict[str, str] = field(default_factory=dict)
+    follow_redirects: bool = True
+    max_redirects: int = 10
+    slow_threshold_ms: int = 3000
+    check_ssl: bool = True
+    check_domain: bool = True
+    domain: str | None = None  # registered domain for WHOIS; derived from url if omitted
+    on_vps: bool = True  # hosted on the monitored VPS (enables VPS-based diagnosis)
+    error_log: str | None = None  # per-site web server error log path on the VPS
+    verify_ssl: bool = True
+
+    @property
+    def hostname(self) -> str:
+        return urlparse(self.url).hostname or ""
+
+    @property
+    def is_https(self) -> bool:
+        return self.url.lower().startswith("https://")
+
+
+@dataclass
+class Thresholds:
+    ram_percent: float = 90.0
+    disk_percent: float = 95.0
+    disk_warn_percent: float = 85.0
+    cpu_load_per_core: float = 2.0
+    ssl_warn_days: int = 14
+    ssl_critical_days: int = 3
+    domain_warn_days: int = 30
+
+
+@dataclass
+class SshConfig:
+    user: str
+    key_file: str
+    port: int = 22
+    key_passphrase: str | None = None
+    known_hosts: str | None = None
+    timeout: float = 10.0
+    use_sudo: bool = False
+    services: list[str] = field(default_factory=lambda: [
+        "nginx", "apache2", "httpd", "mysql", "mysqld", "mariadb", "php*-fpm", "docker",
+    ])
+    check_pm2: bool = True
+    check_docker_containers: bool = True
+    error_logs: list[str] = field(default_factory=lambda: [
+        "/var/log/nginx/error.log", "/var/log/apache2/error.log", "/var/log/httpd/error_log",
+    ])
+    error_log_lines: int = 20
+
+
+@dataclass
+class VpsConfig:
+    host: str
+    name: str = "VPS"
+    ports: list[int] = field(default_factory=lambda: [22, 80, 443])
+    port_timeout: float = 8.0
+    ssh: SshConfig | None = None
+
+
+@dataclass
+class EmailConfig:
+    host: str
+    port: int
+    from_addr: str
+    to: list[str]
+    username: str | None = None
+    password: str | None = None
+    security: str = "ssl"  # ssl | starttls | none
+    timeout: float = 20.0
+
+
+@dataclass
+class TelegramConfig:
+    bot_token: str
+    chat_ids: list[str]
+    timeout: float = 15.0
+
+
+@dataclass
+class AlertsConfig:
+    consecutive_failures: int = 2
+    throttle_minutes: int = 30
+    warning_repeat_hours: int = 24
+    email: EmailConfig | None = None
+    telegram: TelegramConfig | None = None
+
+
+@dataclass
+class DailyReportConfig:
+    enabled: bool = True
+    time: str = "08:00"
+    channels: list[str] = field(default_factory=lambda: ["email"])
+
+
+@dataclass
+class DashboardConfig:
+    enabled: bool = True
+    host: str = "0.0.0.0"
+    port: int = 8080
+    username: str = "admin"
+    password: str | None = None
+
+
+@dataclass
+class GeneralConfig:
+    check_interval_minutes: int = 5
+    max_workers: int = 20
+    database: str = "data/monitor.db"
+    log_file: str = "logs/monitor.log"
+    log_level: str = "INFO"
+    retention_days: int = 90
+    timezone: str = "UTC"
+    user_agent: str = "SiteMonitor/1.0 (+uptime check)"
+
+
+@dataclass
+class Config:
+    general: GeneralConfig
+    thresholds: Thresholds
+    alerts: AlertsConfig
+    daily_report: DailyReportConfig
+    dashboard: DashboardConfig
+    sites: list[SiteConfig]
+    vps: VpsConfig | None = None
+    base_dir: Path = Path(".")
+
+
+# --------------------------------------------------------------------------- helpers
+
+_TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+
+
+def _section(raw: dict[str, Any], key: str) -> dict[str, Any]:
+    value = raw.get(key) or {}
+    if not isinstance(value, dict):
+        raise ConfigError(f"'{key}' must be a mapping")
+    return value
+
+
+def _pick(data: dict[str, Any], cls: type, where: str) -> dict[str, Any]:
+    """Return the keys of ``data`` that ``cls`` accepts; reject unknown keys to catch typos."""
+    allowed = set(cls.__dataclass_fields__)
+    unknown = set(data) - allowed
+    if unknown:
+        raise ConfigError(f"Unknown key(s) in {where}: {', '.join(sorted(unknown))}")
+    return dict(data)
+
+
+def _as_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    return list(value) if isinstance(value, (list, tuple)) else [value]
+
+
+def _env(name: str) -> str | None:
+    value = os.environ.get(name, "").strip()
+    return value or None
+
+
+def _resolve(base: Path, path: str) -> str:
+    p = Path(os.path.expanduser(path))
+    return str(p if p.is_absolute() else (base / p).resolve())
+
+
+def _build_site(raw: dict[str, Any], defaults: dict[str, Any], index: int) -> SiteConfig:
+    if not isinstance(raw, dict):
+        raise ConfigError(f"sites[{index}] must be a mapping")
+    merged = {**defaults, **raw}
+    where = f"sites[{index}] ({raw.get('name', '?')})"
+    data = _pick(merged, SiteConfig, where)
+    if not data.get("name") or not data.get("url"):
+        raise ConfigError(f"{where}: 'name' and 'url' are required")
+    parsed = urlparse(str(data["url"]))
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ConfigError(f"{where}: url must be http(s)://host/..., got {data['url']!r}")
+    if "expected_status" in data and data["expected_status"] is not None:
+        data["expected_status"] = [int(s) for s in _as_list(data["expected_status"])]
+    data["forbidden_keywords"] = [str(k) for k in _as_list(data.get("forbidden_keywords"))]
+    data["headers"] = {str(k): str(v) for k, v in (data.get("headers") or {}).items()}
+    site = SiteConfig(**data)
+    if site.timeout <= 0:
+        raise ConfigError(f"{where}: timeout must be > 0")
+    return site
+
+
+def load_config(path: str | os.PathLike[str] = "config.yaml", env_file: str | None = None) -> Config:
+    """Load ``config.yaml`` plus secrets from the environment / ``.env``.
+
+    Relative paths (database, log file, SSH key) are resolved against the
+    directory that contains the config file.
+    """
+    cfg_path = Path(path).resolve()
+    if not cfg_path.exists():
+        raise ConfigError(f"Config file not found: {cfg_path} (copy config.example.yaml to config.yaml)")
+    base = cfg_path.parent
+    load_dotenv(env_file or base / ".env", override=False)
+
+    try:
+        raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"Invalid YAML in {cfg_path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ConfigError("Top level of config.yaml must be a mapping")
+
+    general = GeneralConfig(**_pick(_section(raw, "general"), GeneralConfig, "general"))
+    general.database = _resolve(base, general.database)
+    general.log_file = _resolve(base, general.log_file)
+    if general.check_interval_minutes < 1:
+        raise ConfigError("general.check_interval_minutes must be >= 1")
+
+    thresholds = Thresholds(**_pick(_section(raw, "thresholds"), Thresholds, "thresholds"))
+
+    # --- VPS
+    vps: VpsConfig | None = None
+    vps_raw = _section(raw, "vps")
+    if vps_raw.get("host"):
+        ssh_raw = vps_raw.pop("ssh", None)
+        vps = VpsConfig(**_pick(vps_raw, VpsConfig, "vps"))
+        vps.ports = [int(p) for p in vps.ports]
+        if ssh_raw and ssh_raw.get("enabled", True) and ssh_raw.get("user") and ssh_raw.get("key_file"):
+            ssh_raw = {k: v for k, v in ssh_raw.items() if k != "enabled"}
+            ssh = SshConfig(**_pick(ssh_raw, SshConfig, "vps.ssh"))
+            ssh.key_file = _resolve(base, ssh.key_file)
+            ssh.known_hosts = _resolve(base, ssh.known_hosts) if ssh.known_hosts else str(
+                Path(general.database).parent / "known_hosts")
+            ssh.key_passphrase = _env("SSH_KEY_PASSPHRASE")
+            vps.ssh = ssh
+
+    # --- alerts
+    alerts_raw = _section(raw, "alerts")
+    email_raw = alerts_raw.pop("email", None) or {}
+    tg_raw = alerts_raw.pop("telegram", None) or {}
+    alerts = AlertsConfig(**_pick(alerts_raw, AlertsConfig, "alerts"))
+    if alerts.consecutive_failures < 1:
+        raise ConfigError("alerts.consecutive_failures must be >= 1")
+
+    if email_raw.get("enabled", False):
+        email_raw = {k: v for k, v in email_raw.items() if k != "enabled"}
+        email = EmailConfig(**_pick(email_raw, EmailConfig, "alerts.email"))
+        email.to = [str(a) for a in _as_list(email.to)]
+        email.password = _env("SMTP_PASSWORD")
+        email.username = email.username or _env("SMTP_USERNAME")
+        if email.security not in ("ssl", "starttls", "none"):
+            raise ConfigError("alerts.email.security must be ssl, starttls or none")
+        if not email.to:
+            raise ConfigError("alerts.email.to needs at least one recipient")
+        alerts.email = email
+
+    if tg_raw.get("enabled", False):
+        token = _env("TELEGRAM_BOT_TOKEN")
+        if not token:
+            raise ConfigError("Telegram is enabled but TELEGRAM_BOT_TOKEN is not set in .env")
+        chat_ids = [str(c) for c in _as_list(tg_raw.get("chat_ids"))]
+        if not chat_ids:
+            raise ConfigError("alerts.telegram.chat_ids needs at least one chat id")
+        alerts.telegram = TelegramConfig(bot_token=token, chat_ids=chat_ids,
+                                         timeout=float(tg_raw.get("timeout", 15)))
+
+    daily = DailyReportConfig(**_pick(_section(raw, "daily_report"), DailyReportConfig, "daily_report"))
+    if not _TIME_RE.match(daily.time):
+        raise ConfigError(f"daily_report.time must be HH:MM, got {daily.time!r}")
+
+    dashboard = DashboardConfig(**_pick(_section(raw, "dashboard"), DashboardConfig, "dashboard"))
+    dashboard.password = _env("DASHBOARD_PASSWORD")
+
+    # --- sites
+    defaults = _section(raw, "defaults")
+    defaults.setdefault("slow_threshold_ms", 3000)
+    sites = [_build_site(s, defaults, i) for i, s in enumerate(raw.get("sites") or [])]
+    if not sites:
+        raise ConfigError("No sites configured under 'sites'")
+    names = [s.name for s in sites]
+    dupes = {n for n in names if names.count(n) > 1}
+    if dupes:
+        raise ConfigError(f"Duplicate site names: {', '.join(sorted(dupes))}")
+
+    return Config(general=general, thresholds=thresholds, alerts=alerts, daily_report=daily,
+                  dashboard=dashboard, sites=sites, vps=vps, base_dir=base)

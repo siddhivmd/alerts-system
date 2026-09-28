@@ -1,0 +1,443 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Site Monitor</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb; --surface-2: #f3f2ee;
+  --text: #0b0b0b; --text-2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11,11,11,0.10);
+  --series: #2a78d6; --series-wash: rgba(42,120,214,0.10);
+  --good: #0ca30c; --good-text: #006300; --warning: #fab219; --warning-text: #8a5a00;
+  --critical: #d03b3b; --critical-text: #b12c2c; --critical-wash: rgba(208,59,59,0.10);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --surface-2: #232321;
+    --text: #ffffff; --text-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10);
+    --series: #3987e5; --series-wash: rgba(57,135,229,0.14);
+    --good-text: #0ca30c; --warning-text: #fab219; --critical-text: #e66767; --critical-wash: rgba(208,59,59,0.18);
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --surface-2: #232321;
+  --text: #ffffff; --text-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10);
+  --series: #3987e5; --series-wash: rgba(57,135,229,0.14);
+  --good-text: #0ca30c; --warning-text: #fab219; --critical-text: #e66767; --critical-wash: rgba(208,59,59,0.18);
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--page); color: var(--text);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1240px; margin: 0 auto; padding: 20px 16px 48px; }
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 20px; margin-bottom: 16px; }
+h1 { font-size: 20px; margin: 0; font-weight: 650; }
+h2 { font-size: 15px; margin: 0 0 12px; font-weight: 600; }
+.meta { color: var(--text-2); font-size: 13px; }
+.meta button { font: inherit; color: var(--text-2); background: none; border: 1px solid var(--border);
+  border-radius: 6px; padding: 2px 8px; cursor: pointer; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+.banner { display: none; border-radius: 10px; padding: 12px 16px; margin-bottom: 16px; font-weight: 600;
+  background: var(--critical-wash); color: var(--critical-text); border: 1px solid var(--critical); }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+.tile { background: var(--surface-2); border-radius: 8px; padding: 12px; min-height: 92px; }
+.tile .label { color: var(--text-2); font-size: 12px; }
+.tile .value { font-size: 26px; font-weight: 650; margin: 2px 0 6px; }
+.tile .sub { color: var(--muted); font-size: 12px; }
+.meter { height: 6px; background: var(--grid); border-radius: 3px; overflow: hidden; margin-top: 4px; }
+.meter span { display: block; height: 100%; border-radius: 3px; background: var(--series); }
+.meter span.warn { background: var(--warning); } .meter span.crit { background: var(--critical); }
+.status { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; white-space: nowrap; }
+.status .icon { width: 10px; height: 10px; display: inline-block; }
+.status.up { color: var(--good-text); } .status.warning { color: var(--warning-text); }
+.status.down { color: var(--critical-text); } .status.none { color: var(--muted); }
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { text-align: left; color: var(--text-2); font-weight: 600; font-size: 12px; padding: 6px 8px;
+  border-bottom: 1px solid var(--axis); white-space: nowrap; }
+td { padding: 8px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+tbody tr.site { cursor: pointer; }
+tbody tr.site:hover, tbody tr.site.selected { background: var(--surface-2); }
+.site-name { font-weight: 600; }
+.site-url { color: var(--muted); font-size: 12px; word-break: break-all; }
+.why { color: var(--text-2); max-width: 380px; }
+.why .fix { color: var(--muted); font-size: 12px; margin-top: 4px; }
+.why code { font-size: 12px; }
+.days-warn { color: var(--warning-text); font-weight: 600; } .days-crit { color: var(--critical-text); font-weight: 600; }
+.chart-head { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline; justify-content: space-between; }
+select { font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--border);
+  border-radius: 6px; padding: 4px 8px; max-width: 100%; }
+.chart { position: relative; }
+.chart svg { display: block; width: 100%; height: 260px; }
+.tooltip { position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 8px; padding: 6px 10px; font-size: 12px; box-shadow: 0 4px 16px rgba(0,0,0,.12);
+  white-space: nowrap; display: none; }
+.tooltip strong { font-size: 14px; }
+.legend { display: flex; gap: 16px; color: var(--text-2); font-size: 12px; margin-top: 6px; flex-wrap: wrap; }
+.legend i { display: inline-block; vertical-align: middle; margin-right: 6px; }
+.empty { color: var(--muted); padding: 24px 0; text-align: center; }
+.services { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+.chip { font-size: 12px; border-radius: 999px; padding: 2px 10px; background: var(--surface-2); color: var(--text-2); }
+.chip.bad { background: var(--critical-wash); color: var(--critical-text); font-weight: 600; }
+.ongoing { color: var(--critical-text); font-weight: 600; }
+/* Phones: the sites table becomes one stacked card per site. */
+@media (max-width: 720px) {
+  #sites-table thead { display: none; }
+  #sites-table tr.site { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; padding: 12px 4px;
+    border-bottom: 1px solid var(--grid); }
+  #sites-table td { border: 0; padding: 0; min-width: 0; }
+  #sites-table td.cell-wide { grid-column: 1 / -1; }
+  #sites-table td.num { text-align: left; }
+  #sites-table td[data-label]::before { content: attr(data-label); display: block; color: var(--muted); font-size: 11px; }
+  .why { max-width: none; }
+  .tiles { grid-template-columns: 1fr 1fr; }
+  .banner, .card { padding: 12px; }
+}
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Site Monitor</h1>
+    <span class="meta" id="counts">Loading…</span>
+    <span class="meta" id="updated"></span>
+    <span class="meta"><button id="theme" type="button" aria-label="Toggle light/dark theme">Theme</button></span>
+  </header>
+
+  <div class="banner" id="banner" role="alert"></div>
+
+  <section class="card" id="vps-card" aria-labelledby="vps-title">
+    <h2 id="vps-title">VPS</h2>
+    <div class="tiles" id="vps-tiles"></div>
+    <div class="services" id="vps-services"></div>
+  </section>
+
+  <section class="card" aria-labelledby="sites-title">
+    <h2 id="sites-title">Sites</h2>
+    <div class="table-wrap">
+      <table id="sites-table">
+        <thead><tr>
+          <th>Status</th><th>Site</th><th>Diagnosis</th>
+          <th class="num">Response</th><th class="num">Uptime 24h</th>
+          <th class="num">SSL</th><th class="num">Domain</th><th>Last 24h</th>
+        </tr></thead>
+        <tbody id="sites"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card" aria-labelledby="chart-title">
+    <div class="chart-head">
+      <h2 id="chart-title">Response time, last 24 hours</h2>
+      <label class="meta">Site <select id="site-select"></select></label>
+    </div>
+    <div class="chart" id="chart"></div>
+    <div class="legend">
+      <span><i style="width:16px;height:2px;background:var(--series)"></i>Response time (ms)</span>
+      <span><i style="width:12px;height:10px;background:var(--critical-wash);border-top:2px solid var(--critical)"></i>Down</span>
+      <span><i style="width:16px;height:1px;background:var(--muted)"></i>Slow threshold</span>
+    </div>
+  </section>
+
+  <section class="card" aria-labelledby="inc-title">
+    <h2 id="inc-title">Incident history</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Site</th><th>Started</th><th>Ended</th><th class="num">Duration</th><th>Cause</th></tr></thead>
+        <tbody id="incidents"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script>
+(() => {
+  const REFRESH_MS = {{ refresh_seconds }} * 1000;
+  const SVGNS = "http://www.w3.org/2000/svg";
+  let state = { status: null, history: null, selected: null };
+
+  // ---------- theme toggle (per-viewer convenience only)
+  const root = document.documentElement;
+  try { const t = localStorage.getItem("sm-theme"); if (t) root.dataset.theme = t; } catch (e) {}
+  document.getElementById("theme").addEventListener("click", () => {
+    const dark = root.dataset.theme ? root.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+    root.dataset.theme = dark ? "light" : "dark";
+    try { localStorage.setItem("sm-theme", root.dataset.theme); } catch (e) {}
+    renderChart();
+  });
+
+  // ---------- helpers (all data goes through textContent - never innerHTML)
+  const el = (tag, attrs = {}, ...children) => {
+    const n = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs)) {
+      if (k === "class") n.className = v; else if (k === "text") n.textContent = v; else n.setAttribute(k, v);
+    }
+    for (const c of children) if (c != null) n.append(c);
+    return n;
+  };
+  const svg = (tag, attrs = {}) => {
+    const n = document.createElementNS(SVGNS, tag);
+    for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v);
+    return n;
+  };
+  const css = name => getComputedStyle(root).getPropertyValue(name).trim();
+  const fmtTime = ts => ts ? new Date(ts * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "–";
+  const fmtHour = ts => new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const fmtDur = s => {
+    s = Math.max(0, Math.round(s));
+    const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+    return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : m ? `${m}m` : `${s}s`;
+  };
+  const ago = ts => ts ? fmtDur(Date.now() / 1000 - ts) + " ago" : "never";
+
+  function statusBadge(status) {
+    const s = status || "none";
+    const label = { up: "Up", warning: "Warning", down: "Down", none: "No data" }[s];
+    const icon = svg("svg", { class: "icon", viewBox: "0 0 10 10", "aria-hidden": "true" });
+    if (s === "up") icon.append(svg("circle", { cx: 5, cy: 5, r: 4.5, fill: css("--good") }));
+    else if (s === "warning") icon.append(svg("path", { d: "M5 0.5 L9.7 9.5 L0.3 9.5 Z", fill: css("--warning") }));
+    else if (s === "down") icon.append(svg("rect", { x: 0.5, y: 0.5, width: 9, height: 9, rx: 1.5, fill: css("--critical") }));
+    else icon.append(svg("circle", { cx: 5, cy: 5, r: 4, fill: "none", stroke: css("--muted"), "stroke-width": 1.5 }));
+    return el("span", { class: `status ${s}` }, icon, label);
+  }
+
+  function days(n, warn, crit) {
+    if (n === null || n === undefined) return el("span", { class: "meta", text: "–" });
+    const cls = n <= crit ? "days-crit" : n <= warn ? "days-warn" : "";
+    return el("span", { class: cls, text: n < 0 ? "expired" : `${n}d` });
+  }
+
+  // ---------- VPS
+  function meterTile(label, value, unit, pct, warnAt, critAt, sub) {
+    const tile = el("div", { class: "tile" });
+    tile.append(el("div", { class: "label", text: label }));
+    tile.append(el("div", { class: "value", text: value === null || value === undefined ? "–" : `${value}${unit}` }));
+    if (pct !== null && pct !== undefined) {
+      const bar = el("span");
+      bar.style.width = Math.min(100, Math.max(0, pct)) + "%";
+      if (pct >= critAt) bar.className = "crit"; else if (pct >= warnAt) bar.className = "warn";
+      tile.append(el("div", { class: "meter", role: "img", "aria-label": `${label} ${Math.round(pct)}%` }, bar));
+    }
+    if (sub) tile.append(el("div", { class: "sub", text: sub }));
+    return tile;
+  }
+
+  function renderVps(v) {
+    const card = document.getElementById("vps-card");
+    if (!v) { card.style.display = "none"; return; }
+    card.style.display = "";
+    document.getElementById("vps-title").textContent = `VPS ${v.name} (${v.host})`;
+    const tiles = document.getElementById("vps-tiles");
+    tiles.replaceChildren();
+    const reach = el("div", { class: "tile" }, el("div", { class: "label", text: "Reachability" }));
+    reach.append(el("div", { class: "value" }, statusBadge(v.ts ? (v.reachable ? "up" : "down") : null)));
+    const ports = Object.entries(v.ports || {}).map(([p, ok]) => `${p} ${ok ? "open" : "closed"}`).join(" · ");
+    reach.append(el("div", { class: "sub", text: ports || "no data" }));
+    tiles.append(reach);
+    const t = v.thresholds;
+    if (v.ram_percent !== null && v.ram_percent !== undefined) {
+      tiles.append(meterTile("RAM used", Math.round(v.ram_percent), "%", v.ram_percent, t.ram - 10, t.ram, `alert at ${t.ram}%`));
+      tiles.append(meterTile("Disk used (/)", Math.round(v.disk_percent), "%", v.disk_percent, t.disk_warn, t.disk, `alert at ${t.disk}%`));
+      const perCore = v.cpu_cores ? v.cpu_load / v.cpu_cores : null;
+      tiles.append(meterTile("CPU load (1 min)", v.cpu_load !== null ? v.cpu_load.toFixed(2) : null, "",
+        perCore !== null ? perCore / t.load_per_core * 100 : null, 75, 100, `${v.cpu_cores || "?"} cores · alert at ${t.load_per_core}/core`));
+      tiles.append(meterTile("OOM kills (24h)", v.oom_kills, "", null, 0, 0, v.oom_kills ? "processes killed for memory" : "none"));
+    } else {
+      tiles.append(el("div", { class: "tile" }, el("div", { class: "label", text: "Server stats" }),
+        el("div", { class: "sub", text: v.ssh_configured ? (v.error || "no data yet") : "SSH not configured: only external checks run" })));
+    }
+    const svc = document.getElementById("vps-services");
+    svc.replaceChildren();
+    for (const [name, s] of Object.entries(v.services || {})) {
+      const bad = s.active === "failed" || (s.active === "inactive" && s.enabled === "enabled");
+      svc.append(el("span", { class: "chip" + (bad ? " bad" : ""), text: `${name}: ${s.active}` }));
+    }
+  }
+
+  // ---------- sites table + sparklines
+  function sparkline(points) {
+    const w = 120, h = 28, s = svg("svg", { width: w, height: h, viewBox: `0 0 ${w} ${h}`, role: "img" });
+    if (!points || !points.length) { s.setAttribute("aria-label", "no data"); return s; }
+    const t0 = Date.now() / 1000 - 86400, t1 = Date.now() / 1000;
+    const vals = points.filter(p => p[1] !== null).map(p => p[1]);
+    const max = Math.max(1, ...vals);
+    const x = ts => (ts - t0) / (t1 - t0) * (w - 4) + 2, y = v => h - 3 - v / max * (h - 8);
+    for (const p of points) if (p[2] === "down")
+      s.append(svg("rect", { x: x(p[0]) - 1, y: 0, width: 2.5, height: h, fill: css("--critical"), opacity: 0.55 }));
+    let d = "", pen = false;
+    for (const p of points) {
+      if (p[1] === null) { pen = false; continue; }
+      d += `${pen ? "L" : "M"}${x(p[0]).toFixed(1)},${y(p[1]).toFixed(1)}`; pen = true;
+    }
+    s.append(svg("path", { d, fill: "none", stroke: css("--series"), "stroke-width": 1.5, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+    s.setAttribute("aria-label", `response time sparkline, max ${Math.round(max)} ms`);
+    return s;
+  }
+
+  function renderSites(sites, history) {
+    const body = document.getElementById("sites");
+    body.replaceChildren();
+    if (!sites.length) { body.append(el("tr", {}, el("td", { colspan: 8, class: "empty", text: "No checks yet - the first cycle is running." }))); return; }
+    for (const s of sites) {
+      const why = el("div", { class: "why", text: s.status === "up" ? "OK" : (s.summary || "") });
+      if (s.status === "down" && s.fixes && s.fixes.length) why.append(el("div", { class: "fix" }, "Fix: ", el("code", { text: s.fixes[0] })));
+      if (s.incident_since) why.append(el("div", { class: "fix", text: `Down for ${fmtDur(Date.now() / 1000 - s.incident_since)}` }));
+      const tr = el("tr", { class: "site" + (s.name === state.selected ? " selected" : ""), tabindex: 0 },
+        el("td", { class: "cell-wide" }, statusBadge(s.status)),
+        el("td", { class: "cell-wide" }, el("div", { class: "site-name", text: s.name }), el("div", { class: "site-url", text: s.url })),
+        el("td", { class: "cell-wide" }, why),
+        el("td", { class: "num", "data-label": "Response", text: s.response_ms !== null ? `${s.response_ms} ms` : "–" }),
+        el("td", { class: "num", "data-label": "Uptime 24h", text: s.uptime_24h !== null ? `${s.uptime_24h.toFixed(2)}%` : "–" }),
+        el("td", { class: "num", "data-label": "SSL" }, days(s.ssl_days_left, 14, 3)),
+        el("td", { class: "num", "data-label": "Domain" }, days(s.domain_days_left, 30, 7)),
+        el("td", { class: "cell-wide", "data-label": "Last 24h" }, sparkline(history && history.sites[s.name])));
+      const pick = () => { state.selected = s.name; document.getElementById("site-select").value = s.name; renderAll(); };
+      tr.addEventListener("click", pick);
+      tr.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pick(); } });
+      body.append(tr);
+    }
+  }
+
+  // ---------- detail chart
+  function renderChart() {
+    const box = document.getElementById("chart");
+    box.replaceChildren();
+    const site = state.status && state.status.sites.find(s => s.name === state.selected);
+    const pts = (state.history && state.history.sites[state.selected]) || [];
+    if (!site || !pts.length) { box.append(el("div", { class: "empty", text: "No data for the last 24 hours yet." })); return; }
+
+    const W = Math.max(320, box.clientWidth), H = 260, m = { l: 52, r: 16, t: 12, b: 26 };
+    const now = Date.now() / 1000, t0 = now - 86400;
+    const vals = pts.filter(p => p[1] !== null).map(p => p[1]);
+    const niceMax = v => { const e = Math.pow(10, Math.floor(Math.log10(v))); return [1, 2, 2.5, 5, 10].map(k => k * e).find(k => k >= v); };
+    // Show the slow-threshold line only when the data gets near it, so fast sites keep a readable scale.
+    const dataMax = Math.max(100, ...vals), thr = site.slow_threshold_ms || 0;
+    const yMax = niceMax((dataMax > thr * 0.6 ? Math.max(dataMax, thr) : dataMax) * 1.05);
+    const x = ts => m.l + (ts - t0) / (now - t0) * (W - m.l - m.r);
+    const y = v => H - m.b - v / yMax * (H - m.t - m.b);
+    const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": `Response time for ${site.name} over the last 24 hours` });
+
+    for (let i = 0; i <= 4; i++) {  // recessive hairline grid
+      const v = yMax / 4 * i;
+      s.append(svg("line", { x1: m.l, x2: W - m.r, y1: y(v), y2: y(v), stroke: i ? css("--grid") : css("--axis"), "stroke-width": 1 }));
+      const lab = svg("text", { x: m.l - 8, y: y(v) + 4, "text-anchor": "end", fill: css("--muted"), "font-size": 11 });
+      lab.textContent = v >= 1000 ? `${(v / 1000).toFixed(v % 1000 ? 1 : 0)}s` : `${Math.round(v)}`;
+      s.append(lab);
+    }
+    for (let h = 0; h <= 24; h += 6) {
+      const ts = t0 + h * 3600, lab = svg("text", { x: x(ts), y: H - 8, "text-anchor": h === 0 ? "start" : h === 24 ? "end" : "middle", fill: css("--muted"), "font-size": 11 });
+      lab.textContent = h === 24 ? "now" : fmtHour(ts);
+      s.append(lab);
+    }
+    // down periods as shaded bands
+    const step = (state.status.check_interval_minutes || 5) * 60;
+    for (const p of pts) if (p[2] === "down") {
+      s.append(svg("rect", { x: x(p[0] - step / 2), y: m.t, width: Math.max(2, x(p[0] + step / 2) - x(p[0] - step / 2)), height: H - m.t - m.b, fill: css("--critical-wash") }));
+      s.append(svg("rect", { x: x(p[0] - step / 2), y: m.t, width: Math.max(2, x(p[0] + step / 2) - x(p[0] - step / 2)), height: 2, fill: css("--critical") }));
+    }
+    if (site.slow_threshold_ms && site.slow_threshold_ms <= yMax) {
+      s.append(svg("line", { x1: m.l, x2: W - m.r, y1: y(site.slow_threshold_ms), y2: y(site.slow_threshold_ms), stroke: css("--muted"), "stroke-width": 1 }));
+      const lab = svg("text", { x: W - m.r, y: y(site.slow_threshold_ms) - 4, "text-anchor": "end", fill: css("--muted"), "font-size": 11 });
+      lab.textContent = `slow > ${site.slow_threshold_ms} ms`;
+      s.append(lab);
+    }
+    let d = "", pen = false;
+    for (const p of pts) { if (p[1] === null) { pen = false; continue; } d += `${pen ? "L" : "M"}${x(p[0]).toFixed(1)},${y(p[1]).toFixed(1)}`; pen = true; }
+    s.append(svg("path", { d, fill: "none", stroke: css("--series"), "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+    const last = [...pts].reverse().find(p => p[1] !== null);
+    if (last) s.append(svg("circle", { cx: x(last[0]), cy: y(last[1]), r: 4, fill: css("--series"), stroke: css("--surface"), "stroke-width": 2 }));
+
+    // crosshair + tooltip
+    const cross = svg("line", { y1: m.t, y2: H - m.b, stroke: css("--axis"), "stroke-width": 1, visibility: "hidden" });
+    const dot = svg("circle", { r: 4, fill: css("--series"), stroke: css("--surface"), "stroke-width": 2, visibility: "hidden" });
+    const hit = svg("rect", { x: m.l, y: m.t, width: W - m.l - m.r, height: H - m.t - m.b, fill: "transparent" });
+    s.append(cross, dot, hit);
+    box.append(s);
+    const tip = el("div", { class: "tooltip" });
+    box.append(tip);
+    const move = ev => {
+      const r = s.getBoundingClientRect(), px = (ev.clientX - r.left) * W / r.width;
+      const ts = t0 + (px - m.l) / (W - m.l - m.r) * (now - t0);
+      let best = pts[0];
+      for (const p of pts) if (Math.abs(p[0] - ts) < Math.abs(best[0] - ts)) best = p;
+      cross.setAttribute("x1", x(best[0])); cross.setAttribute("x2", x(best[0])); cross.setAttribute("visibility", "visible");
+      if (best[1] !== null) { dot.setAttribute("cx", x(best[0])); dot.setAttribute("cy", y(best[1])); dot.setAttribute("visibility", "visible"); }
+      else dot.setAttribute("visibility", "hidden");
+      tip.replaceChildren(el("strong", { text: best[1] !== null ? `${best[1]} ms` : "no response" }), el("br"),
+        el("span", { class: "meta", text: `${fmtTime(best[0])} · ${best[2]}` }));
+      tip.style.display = "block";
+      const left = x(best[0]) / W * r.width;
+      tip.style.left = Math.min(r.width - tip.offsetWidth - 4, Math.max(4, left + 12)) + "px";
+      tip.style.top = "8px";
+    };
+    hit.addEventListener("pointermove", move);
+    hit.addEventListener("pointerleave", () => { tip.style.display = "none"; cross.setAttribute("visibility", "hidden"); dot.setAttribute("visibility", "hidden"); });
+  }
+
+  function renderSelect(sites) {
+    const sel = document.getElementById("site-select");
+    if (!state.selected || !sites.some(s => s.name === state.selected)) state.selected = sites.length ? sites[0].name : null;
+    sel.replaceChildren(...sites.map(s => el("option", { value: s.name, text: s.name })));
+    sel.value = state.selected || "";
+  }
+  document.getElementById("site-select").addEventListener("change", e => { state.selected = e.target.value; renderAll(); });
+
+  function renderIncidents(list) {
+    const body = document.getElementById("incidents");
+    body.replaceChildren();
+    if (!list.length) { body.append(el("tr", {}, el("td", { colspan: 5, class: "empty", text: "No incidents recorded." }))); return; }
+    for (const i of list) {
+      const dur = (i.ended_at || Date.now() / 1000) - i.started_at;
+      body.append(el("tr", {},
+        el("td", { class: "site-name", text: i.site_name }),
+        el("td", { text: fmtTime(i.started_at) }),
+        el("td", i.ended_at ? { text: fmtTime(i.ended_at) } : { class: "ongoing", text: "Ongoing" }),
+        el("td", { class: "num", text: fmtDur(dur) }),
+        el("td", { class: "why", text: i.cause || "" })));
+    }
+  }
+
+  function renderAll() {
+    const st = state.status; if (!st) return;
+    const c = st.counts;
+    document.getElementById("counts").textContent = `${c.up} up · ${c.warning} warning · ${c.down} down · ${c.total} sites`;
+    document.getElementById("updated").textContent = `Updated ${new Date(st.generated_at * 1000).toLocaleTimeString()} · checks every ${st.check_interval_minutes} min`;
+    const banner = document.getElementById("banner");
+    const down = st.sites.filter(s => s.status === "down");
+    banner.style.display = down.length ? "block" : "none";
+    banner.textContent = down.length ? `${down.length} site(s) down: ${down.map(s => s.name).join(", ")}` : "";
+    document.title = down.length ? `(${down.length} down) Site Monitor` : "Site Monitor";
+    renderVps(st.vps);
+    renderSelect(st.sites);
+    renderSites(st.sites, state.history);
+    renderChart();
+  }
+
+  async function refresh() {
+    try {
+      const opts = { credentials: "same-origin", cache: "no-store" };
+      const [status, history, incidents] = await Promise.all([
+        fetch("api/status", opts).then(r => r.json()),
+        fetch("api/history?hours=24", opts).then(r => r.json()),
+        fetch("api/incidents?limit=50", opts).then(r => r.json())]);
+      state.status = status; state.history = history;
+      renderAll();
+      renderIncidents(incidents.incidents);
+    } catch (e) {
+      document.getElementById("updated").textContent = "Refresh failed - retrying in 30 s";
+    }
+  }
+  refresh();
+  setInterval(refresh, REFRESH_MS);
+  let resizeTimer; addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(renderChart, 150); });
+})();
+</script>
+</body>
+</html>

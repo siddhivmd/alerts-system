@@ -1,0 +1,105 @@
+# Site monitor configuration. Copy to config.yaml and edit.
+# Secrets (passwords, tokens) are NOT set here - put them in .env (see .env.example).
+# Relative paths are resolved against the folder that contains this file.
+
+general:
+  check_interval_minutes: 5      # how often every site is checked
+  max_workers: 20                # parallel checks (sites are checked concurrently)
+  database: data/monitor.db      # SQLite history (sites, checks, incidents)
+  log_file: logs/monitor.log     # rotated at 5 MB, 5 files kept
+  log_level: INFO
+  retention_days: 90             # check history older than this is deleted nightly (incidents are kept)
+  timezone: Asia/Kolkata         # used for the daily report time and times shown in alerts
+  user_agent: "SiteMonitor/1.0 (+uptime check)"
+
+thresholds:
+  ram_percent: 90                # RAM above this is reported as a cause when a site is down
+  disk_percent: 95               # disk above this = "storage full" (critical)
+  disk_warn_percent: 85          # early warning for disk
+  cpu_load_per_core: 2.0         # 1-min load average divided by cores
+  ssl_warn_days: 14              # first SSL expiry warning
+  ssl_critical_days: 3           # second, critical SSL expiry warning
+  domain_warn_days: 30           # WHOIS domain expiry warning
+
+# Settings applied to every site unless the site overrides them.
+defaults:
+  timeout: 15                    # seconds
+  slow_threshold_ms: 3000        # slower than this = "slow response" warning
+  follow_redirects: true
+  check_ssl: true
+  check_domain: true             # WHOIS lookup (cached 24h)
+
+vps:
+  name: Hostinger VPS
+  host: 1.2.3.4                  # your VPS IP address
+  ports: [22, 80, 443]           # all closed = VPS down or ACCOUNT SUSPENDED
+  port_timeout: 8
+  ssh:                           # optional. Remove or set enabled: false to run external checks only.
+    enabled: true
+    user: monitor                # a dedicated low-privilege user is recommended (see README)
+    port: 22
+    key_file: ~/.ssh/monitor_ed25519   # passphrase (if any) goes in .env as SSH_KEY_PASSPHRASE
+    use_sudo: false              # true = run journalctl/dmesg/tail/docker via "sudo -n" (see README)
+    timeout: 10
+    services: [nginx, apache2, httpd, mysql, mysqld, mariadb, "php*-fpm", docker]
+    check_pm2: true
+    check_docker_containers: true
+    error_logs:                  # tail of these is attached to alerts when a site fails
+      - /var/log/nginx/error.log
+      - /var/log/apache2/error.log
+    error_log_lines: 20
+
+alerts:
+  consecutive_failures: 2        # failures in a row before alerting (avoids false alarms)
+  throttle_minutes: 30           # repeat a still-down alert at most this often
+  warning_repeat_hours: 24       # repeat warnings (SSL/domain expiry, slow, disk) at most this often
+  email:
+    enabled: true
+    host: smtp.gmail.com
+    port: 465
+    security: ssl                # ssl (port 465) | starttls (port 587) | none
+    username: you@gmail.com      # password: SMTP_PASSWORD in .env (Gmail: an App Password)
+    from_addr: you@gmail.com
+    to:
+      - you@company.com
+      - teammate@company.com
+  telegram:
+    enabled: false               # bot token: TELEGRAM_BOT_TOKEN in .env
+    chat_ids: ["123456789"]      # user or group chat ids (see README for how to find them)
+
+daily_report:
+  enabled: true
+  time: "09:00"                  # in general.timezone
+  channels: [email]              # email and/or telegram
+
+dashboard:
+  enabled: true
+  host: 0.0.0.0
+  port: 8080
+  username: admin                # password: DASHBOARD_PASSWORD in .env
+
+sites:
+  - name: Main Website
+    url: https://example.com
+    keyword: "Example Domain"    # must appear in the page (case-sensitive)
+
+  - name: Client Portal
+    url: https://portal.example.com/login
+    keyword: "Login"
+    forbidden_keywords:          # page is DOWN if any of these appear
+      - "Error establishing a database connection"
+      - "Fatal error"
+    timeout: 20
+    slow_threshold_ms: 5000
+    error_log: /var/log/nginx/portal.error.log   # per-site log (optional)
+
+  - name: API health
+    url: https://api.example.com/health
+    expected_status: [200, 204]
+    headers:
+      Accept: application/json
+    domain: example.com          # WHOIS domain, if it cannot be derived from the URL
+
+  - name: Marketing site (not on the VPS)
+    url: https://www.example.org
+    on_vps: false                # hosted elsewhere: skip VPS-based diagnosis

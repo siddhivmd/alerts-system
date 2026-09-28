@@ -1,0 +1,12 @@
+.git
+.env
+config.yaml
+data/
+logs/
+ssh/
+tests/
+**/__pycache__
+.pytest_cache
+.venv
+venv
+*.db

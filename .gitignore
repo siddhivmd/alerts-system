@@ -1,0 +1,21 @@
+# secrets and local config
+.env
+config.yaml
+*.pem
+id_*
+*_ed25519
+*_rsa
+
+# runtime data
+data/
+logs/
+*.db
+*.db-wal
+*.db-shm
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
