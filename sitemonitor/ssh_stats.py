@@ -10,18 +10,23 @@ from __future__ import annotations
 import fnmatch
 import json
 import logging
+import re
 import shlex
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .config import SshConfig
+from .config import SecurityConfig, SshConfig
 
 log = logging.getLogger(__name__)
 
 # systemd states that mean "this service should be running but is not".
 _BAD_ACTIVE = {"failed"}
 _PM2_BAD = {"errored", "stopped", "stopping", "launching"}
+# "Invalid user" and "Failed password for invalid user" describe the same attempt: count it once.
+_FAILED_LOGIN = re.compile(r"Failed password for (?!invalid user)|Invalid user")
+_FROM_IP = re.compile(r"from ((?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F]*:[0-9a-fA-F:]+)")
 
 
 @dataclass
@@ -43,6 +48,13 @@ class VpsStats:
     pm2: list[dict[str, Any]] = field(default_factory=list)
     docker: list[dict[str, str]] = field(default_factory=list)
     error_logs: dict[str, list[str]] = field(default_factory=dict)
+    # security data (only collected when security checks are enabled)
+    top_processes: list[dict[str, Any]] = field(default_factory=list)  # {pid, user, cpu, comm, args}
+    new_php_files: list[str] = field(default_factory=list)
+    failed_ssh_logins: int | None = None
+    failed_ssh_window: str = "last hour"
+    failed_ssh_top_ips: list[tuple[str, int]] = field(default_factory=list)
+    outbound_smtp: int | None = None
 
     # ---- derived views used by the diagnosis engine
     @property
@@ -83,11 +95,29 @@ class VpsStats:
         return d
 
 
-def _stats_script(cfg: SshConfig) -> str:
+def _security_script(sec: SecurityConfig, sudo: str) -> str:
+    """Read-only commands for the security checks (see security.py for how results are judged)."""
+    roots = " ".join(shlex.quote(r) for r in sec.web_roots)
+    find_php = (f"{sudo}find {roots} -xdev -type f \\( -name '*.php' -o -name '*.phtml' -o -name '*.phar' \\) "
+                f"-mmin -{int(sec.php_watch_minutes)} 2>/dev/null | head -n 200") if roots else ":"
+    return f"""echo '##PROCS'; ps -eo pid=,user=,pcpu=,comm=,args= --sort=-pcpu 2>/dev/null | head -n 10
+echo '##NEWPHP'; {find_php}
+echo '##SSHFAIL'
+if command -v journalctl >/dev/null 2>&1; then
+  echo 'window=last hour'; {sudo}journalctl -u ssh -u sshd --since '1 hour ago' --no-pager -q 2>/dev/null | grep -E 'Failed password|Invalid user' | tail -n 5000
+else
+  echo 'window=recent log lines'; tail -n 5000 /var/log/auth.log /var/log/secure 2>/dev/null | grep -E 'Failed password|Invalid user'
+fi
+echo '##SMTPOUT'; ss -tn state established '( dport = :25 or dport = :465 or dport = :587 )' 2>/dev/null | tail -n +2 | wc -l
+"""
+
+
+def _stats_script(cfg: SshConfig, security: SecurityConfig | None = None) -> str:
     sudo = "sudo -n " if cfg.use_sudo else ""
     pm2 = "command -v pm2 >/dev/null 2>&1 && pm2 jlist 2>/dev/null" if cfg.check_pm2 else ":"
     docker = (f"command -v docker >/dev/null 2>&1 && {sudo}docker ps -a "
               "--format '{{.Names}}|{{.State}}|{{.Status}}' 2>/dev/null") if cfg.check_docker_containers else ":"
+    sec = _security_script(security, sudo) if security is not None and security.enabled else ""
     return f"""export LC_ALL=C
 echo '##MEM'; grep -E '^(MemTotal|MemAvailable|SwapTotal|SwapFree):' /proc/meminfo
 echo '##LOAD'; cat /proc/loadavg; nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo
@@ -105,7 +135,7 @@ echo '##PM2'
 {pm2}
 echo '##DOCKER'
 {docker}
-echo '##END'
+{sec}echo '##END'
 """
 
 
@@ -206,7 +236,38 @@ def parse_stats(output: str, service_patterns: list[str]) -> VpsStats:
         parts = line.split("|", 2)
         if len(parts) == 3:
             st.docker.append({"name": parts[0], "state": parts[1], "status": parts[2]})
+
+    _parse_security(s, st)
     return st
+
+
+def _parse_security(s: dict[str, list[str]], st: VpsStats) -> None:
+    """Security sections are only present when security checks are enabled."""
+    for line in s.get("PROCS", []):
+        parts = line.split(None, 4)
+        if len(parts) < 4:
+            continue
+        try:
+            st.top_processes.append({"pid": int(parts[0]), "user": parts[1], "cpu": float(parts[2]),
+                                     "comm": parts[3], "args": parts[4][:300] if len(parts) > 4 else parts[3]})
+        except ValueError:
+            continue
+
+    st.new_php_files = [line.strip() for line in s.get("NEWPHP", []) if line.strip().startswith("/")]
+
+    if "SSHFAIL" in s:
+        lines = s["SSHFAIL"]
+        if lines and lines[0].startswith("window="):
+            st.failed_ssh_window = lines[0].split("=", 1)[1]
+            lines = lines[1:]
+        failed = [line for line in lines if _FAILED_LOGIN.search(line)]
+        st.failed_ssh_logins = len(failed)
+        ips = Counter(m.group(1) for line in failed if (m := _FROM_IP.search(line)))
+        st.failed_ssh_top_ips = ips.most_common(3)
+
+    smtp = [line.strip() for line in s.get("SMTPOUT", []) if line.strip()]
+    if smtp and smtp[0].isdigit():
+        st.outbound_smtp = int(smtp[0])
 
 
 # --------------------------------------------------------------------------- SSH plumbing
@@ -245,15 +306,15 @@ def _friendly_error(exc: Exception) -> str:
     return f"SSH failed: {name}: {exc}"
 
 
-def collect_stats(host: str, cfg: SshConfig) -> VpsStats:
-    """Collect all VPS metrics in one SSH session. Never raises."""
+def collect_stats(host: str, cfg: SshConfig, security: SecurityConfig | None = None) -> VpsStats:
+    """Collect all VPS metrics (plus security data if enabled) in one SSH session. Never raises."""
     try:
         client = _connect(host, cfg)
     except Exception as exc:  # noqa: BLE001
         log.warning("SSH connect to %s failed: %s", host, exc)
         return VpsStats(ok=False, error=_friendly_error(exc))
     try:
-        output = _run(client, _stats_script(cfg), timeout=cfg.timeout * 3)
+        output = _run(client, _stats_script(cfg, security), timeout=cfg.timeout * 3)
         return parse_stats(output, cfg.services)
     except Exception as exc:  # noqa: BLE001
         log.warning("Collecting stats from %s failed: %s", host, exc)

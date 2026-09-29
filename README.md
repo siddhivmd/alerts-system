@@ -30,6 +30,7 @@ Run it on a small machine with a **different provider and a different account**:
 | Domain | WHOIS expiry. Warns at 30 days. Cached 24h because registrars rate-limit |
 | VPS ports | TCP 22 / 80 / 443. **All closed = VPS down or account suspended** |
 | VPS over SSH (optional) | RAM %, CPU load, disk %, OOM kills (last 24h), systemd services (nginx/apache, mysql/mariadb, php-fpm, docker), pm2 apps, Docker containers. When a site fails, also the last 20 lines of the web-server error log |
+| Security (optional) | Spam blacklists, Google Safe Browsing, crypto-miners, new PHP files, SSH brute force, outbound spam. See [Security early warning](#security-early-warning) |
 
 Sites are checked in parallel, so 20+ sites finish in about the time of the slowest one.
 
@@ -46,6 +47,31 @@ For a failing site, the first matching rule wins:
 Each diagnosis includes a concrete fix, for example `sudo systemctl restart nginx`.
 
 **Warnings** don't mark a site as down: slow response (above `slow_threshold_ms`), SSL or domain expiring soon, and VPS disk / RAM / CPU / service problems.
+
+## Security early warning
+
+Hosts suspend accounts for "malicious activity", meaning the server was sending spam, attacking other servers, or hosting malware. This almost always happens after a site gets hacked. These checks try to spot it before the host does. All of them are optional, and all of them only **read**; nothing on the server is changed.
+
+| Check | Needs | Raises a warning when |
+|---|---|---|
+| **Spam blacklists** (Spamhaus, SpamCop, PSBL, UCEPROTECT) | Nothing; this is a DNS lookup of the VPS IP | The IP is listed. Critical: a listing usually means the server is sending spam |
+| **Google Safe Browsing** | Free API key in `.env` + `security.safe_browsing: true` | Google flags a site as malware or phishing. Chrome then shows visitors a red warning page |
+| **Crypto-miners** | `vps.ssh` | A process matches known miner names or mining-pool addresses (`stratum+tcp://`) |
+| **Programs running from temp folders** | `vps.ssh` | A process runs from `/tmp`, `/var/tmp` or `/dev/shm`, a classic malware location |
+| **Unknown high-CPU processes** | `vps.ssh` | A process that isn't in `known_processes` uses more than 80% CPU |
+| **New PHP files** | `vps.ssh` | A `.php` file in `web_roots` was created or changed in the last hour. Critical inside an `uploads` folder, where webshells are usually dropped |
+| **SSH brute force** | `vps.ssh` | 100 or more failed SSH logins in an hour. The top attacking IPs are listed, and the fix suggests fail2ban |
+| **Outbound spam** | `vps.ssh` | 20 or more open outbound mail connections (ports 25, 465, 587). This is typical of a hacked site sending spam |
+
+The blacklist and Safe Browsing lookups are rate-limited, so they run once an hour and the result is reused in between. The SSH checks add four read-only commands (`ps`, `find`, `journalctl`, `ss`) to the existing SSH session, so they don't need a second connection. The results appear in the alert emails, in the **Security** panel on the dashboard, in the daily report, and in `monitor.py check`.
+
+**To see a blacklist warning without a real problem:** `config.test.yaml` checks the address `127.0.0.2`. Every blacklist lists that address on purpose, as a test entry.
+
+Notes:
+- **Spamhaus refuses lookups that come through big public DNS servers** such as 8.8.8.8 or 1.1.1.1. The monitor then shows "refused the query" for Spamhaus, which is not the same as being listed. The fix is to use your hosting provider's DNS server, or a free Spamhaus DQS key.
+- **The free Safe Browsing API is for non-commercial use** under Google's terms. For company use, Google's paid Web Risk API is the equivalent.
+- **Deploying code triggers the new-PHP-file warning.** That's expected. Add folders you change often to `php_watch_ignore`.
+- **Permissions:** the `monitor` user needs the `systemd-journal` group (already in the SSH setup below) to read SSH logins. It needs read access to the web folders to find new PHP files.
 
 ## How alerts are sent
 
@@ -243,6 +269,7 @@ python -m pytest
 |---|---|
 | `tests/test_diagnosis.py` | Every diagnosis rule and the priority between rules, using mocked results |
 | `tests/test_alerts.py` | The consecutive-failure rule, 30-minute throttling, recovery with downtime, retry after a failed delivery, state surviving a restart |
+| `tests/test_security.py` | Blacklist answers, including Spamhaus refusing a public resolver and ISP DNS hijacking; Safe Browsing matches and errors; miner, temp-folder and PHP-file detection; SSH brute force; outbound spam; caching. All offline |
 | `tests/test_storage.py`, `tests/test_ssh_stats.py` | The database layer, and the remote-output parser run on realistic sample output |
 | `tests/test_integration.py` | Config validation, a full cycle with mocked network calls (one crashing check must not stop the others), and dashboard auth / API |
 
@@ -253,6 +280,7 @@ monitor.py                 CLI entry point (run / check / test-alerts / report)
 sitemonitor/
   config.py                config.yaml + .env loading and validation
   checks.py                DNS, HTTP, keyword, SSL, WHOIS, VPS TCP ports
+  security.py              blacklists, Safe Browsing, miner / webshell / brute-force / spam signals
   ssh_stats.py             VPS metrics + error logs over SSH (paramiko)
   diagnosis.py             raw results -> root cause + fix (pure functions)
   alerts.py                alert decisions, throttling, email + Telegram

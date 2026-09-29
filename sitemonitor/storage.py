@@ -80,6 +80,12 @@ CREATE TABLE IF NOT EXISTS vps_stats (
 );
 CREATE INDEX IF NOT EXISTS idx_vps_ts ON vps_stats(ts);
 
+CREATE TABLE IF NOT EXISTS kv (
+    key         TEXT PRIMARY KEY,          -- small latest-value records, e.g. "server_status"
+    value       TEXT NOT NULL,             -- JSON
+    updated_at  REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS whois_cache (
     domain      TEXT PRIMARY KEY,
     expires_at  REAL,
@@ -293,6 +299,18 @@ class Storage:
             rows = conn.execute("SELECT ts, reachable, ram_percent, cpu_load, cpu_cores, disk_percent "
                                 "FROM vps_stats WHERE ts >= ? ORDER BY ts", (since,)).fetchall()
         return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------ key-value
+    def set_kv(self, key: str, value: Any) -> None:
+        with self._conn() as conn:
+            conn.execute("INSERT INTO kv(key, value, updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE "
+                         "SET value=excluded.value, updated_at=excluded.updated_at",
+                         (key, json.dumps(value, default=str), time.time()))
+
+    def get_kv(self, key: str) -> Any:
+        with self._conn() as conn:
+            r = conn.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+        return json.loads(r["value"]) if r else None
 
     # ------------------------------------------------------------------ WHOIS cache
     def get_whois(self, domain: str) -> dict[str, Any] | None:

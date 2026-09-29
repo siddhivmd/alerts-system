@@ -55,17 +55,27 @@ def build_daily_report(cfg: Config, storage: Storage, now: float | None = None) 
                 lines.append(f"  RAM {v['ram_percent']:.0f}% | CPU load {load} | Disk {v['disk_percent'] or 0:.0f}% | "
                              f"OOM kills: {v['oom_kills']}")
                 services = v.get("services") or {}
-                bad = [n for n, s in services.items() if s.get("active") == "failed" or (
-                    s.get("active") == "inactive" and s.get("enabled") == "enabled")]
                 states = [f"{name}={st.get('active')}" for name, st in services.items()]
                 lines.append(f"  Services: {', '.join(states) or 'n/a'}")
-                if bad:
-                    warnings.append(f"VPS: service(s) not running: {', '.join(bad)}")
             elif v["error"]:
                 lines.append(f"  Stats unavailable: {v['error']}")
         else:
             lines.append("VPS: no data yet")
         lines.append("")
+
+    # Server health + security (blacklists, Safe Browsing, miners, new PHP files, ...).
+    server = storage.get_kv("server_status") or {}
+    security = server.get("security") or {}
+    if security.get("enabled"):
+        lines.append("Security:")
+        lines += [f"  Spam blacklists: {b}" for b in security.get("blacklists") or []] or \
+            ["  Spam blacklists: no IP to check"]
+        lines.append(f"  Google Safe Browsing: {security.get('safe_browsing') or 'off'}")
+        lines.append(f"  Server checks over SSH: {'on' if security.get('ssh_checks') else 'off'}")
+        lines.append("")
+    for w in server.get("warnings", []):
+        label = "CRITICAL" if w.get("severity") == "critical" else "warning"
+        warnings.append(f"{server.get('name', 'Server')} ({label}): {w.get('message')}")
 
     lines.append("Needs attention:" if warnings else "Needs attention: nothing")
     lines += [f"  - {w}" for w in warnings]

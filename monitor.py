@@ -61,8 +61,22 @@ def print_cycle(cycle: CycleResult, cfg: Config) -> None:
                   f"| OOM kills ({st.oom_window}): {st.oom_kills}")
             services = ", ".join(f"{name}={s.get('active')}" for name, s in st.services.items())
             print(f"  services: {services or 'none found'}")
+        print()
+
+    sec = cycle.security
+    if sec.get("enabled"):
+        print("Security:")
+        for line in sec.get("blacklists") or ["no IP to check (enable vps or add security.extra_ips)"]:
+            print(f"  Spam blacklists: {line}")
+        print(f"  Google Safe Browsing: {sec.get('safe_browsing') or 'off (needs GOOGLE_SAFE_BROWSING_KEY)'}")
+        print(f"  Server checks over SSH: {'on' if sec.get('ssh_checks') else 'off (needs vps.ssh)'}")
+    if cycle.vps_warnings:
+        print("Server warnings:")
         for w in cycle.vps_warnings:
-            print(f"  ! {w.message}")
+            print(f"  {'CRITICAL' if w.severity == 'critical' else 'warning '} {w.message}")
+            if w.fix:
+                print(f"           fix: {w.fix}")
+    if sec.get("enabled") or cycle.vps_warnings:
         print()
 
     for r, d in zip(cycle.results, cycle.diagnoses):
@@ -185,7 +199,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
-        sched.shutdown(wait=False)
+        # Let a check cycle that is already running finish (at most a few seconds), so its
+        # results and alerts are saved and "Monitor stopped" really is the last log line.
+        log.info("Stopping: waiting for any running check cycle to finish...")
+        sched.shutdown(wait=True)
         log.info("Monitor stopped")
     return 0
 

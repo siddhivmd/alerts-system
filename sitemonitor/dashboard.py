@@ -86,9 +86,12 @@ def build_status(cfg: Config, storage: Storage) -> dict[str, Any]:
                "thresholds": {"ram": cfg.thresholds.ram_percent, "disk": cfg.thresholds.disk_percent,
                               "disk_warn": cfg.thresholds.disk_warn_percent,
                               "load_per_core": cfg.thresholds.cpu_load_per_core}}
+    server = storage.get_kv("server_status") or {}
+    security = {"enabled": cfg.security.enabled, "ts": server.get("ts"),
+                "warnings": server.get("warnings", []), **(server.get("security") or {})}
     return {"generated_at": now, "check_interval_minutes": cfg.general.check_interval_minutes,
             "timezone": cfg.general.timezone, "counts": {**counts, "total": len(sites)},
-            "sites": sites, "vps": vps}
+            "sites": sites, "vps": vps, "security": security}
 
 
 def create_app(cfg: Config, storage: Storage, last_cycle: Callable[[], float | None] | None = None) -> Flask:

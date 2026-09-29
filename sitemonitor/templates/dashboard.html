@@ -87,6 +87,13 @@ select { font: inherit; color: var(--text); background: var(--surface); border: 
 .chip { font-size: 12px; border-radius: 999px; padding: 2px 10px; background: var(--surface-2); color: var(--text-2); }
 .chip.bad { background: var(--critical-wash); color: var(--critical-text); font-weight: 600; }
 .ongoing { color: var(--critical-text); font-weight: 600; }
+.sec-list { list-style: none; margin: 0; padding: 0; }
+.sec-list li { padding: 8px 0; border-bottom: 1px solid var(--grid); }
+.sec-list li:last-child { border-bottom: 0; }
+.sec-list .msg { margin-left: 4px; }
+.sec-list .fix { color: var(--muted); font-size: 12px; margin-top: 4px; }
+.sec-meta { color: var(--muted); font-size: 12px; margin-top: 10px; }
+.sec-meta div + div { margin-top: 2px; }
 /* Phones: the sites table becomes one stacked card per site. */
 @media (max-width: 720px) {
   #sites-table thead { display: none; }
@@ -117,6 +124,12 @@ select { font: inherit; color: var(--text); background: var(--surface); border: 
     <h2 id="vps-title">VPS</h2>
     <div class="tiles" id="vps-tiles"></div>
     <div class="services" id="vps-services"></div>
+  </section>
+
+  <section class="card" id="security-card" aria-labelledby="security-title">
+    <h2 id="security-title">Security &amp; server warnings</h2>
+    <ul class="sec-list" id="security-warnings"></ul>
+    <div class="sec-meta" id="security-meta"></div>
   </section>
 
   <section class="card" aria-labelledby="sites-title">
@@ -281,6 +294,32 @@ select { font: inherit; color: var(--text); background: var(--surface); border: 
     return s;
   }
 
+  // ---------- security & server warnings
+  function renderSecurity(sec) {
+    const card = document.getElementById("security-card");
+    if (!sec || (!sec.enabled && !(sec.warnings || []).length)) { card.style.display = "none"; return; }
+    card.style.display = "";
+    const list = document.getElementById("security-warnings");
+    list.replaceChildren();
+    const warnings = [...(sec.warnings || [])].sort((a, b) => (a.severity === "critical" ? 0 : 1) - (b.severity === "critical" ? 0 : 1));
+    if (!warnings.length) {
+      list.append(el("li", {}, statusBadge("up"), el("span", { class: "msg", text: sec.ts ? "No problems found" : "Waiting for the first check" })));
+    }
+    for (const w of warnings) {
+      const li = el("li", {}, statusBadge(w.severity === "critical" ? "down" : "warning"), el("span", { class: "msg", text: w.message }));
+      li.querySelector(".status").lastChild.textContent = w.severity === "critical" ? "Critical" : "Warning";
+      if (w.fix) li.append(el("div", { class: "fix" }, "Fix: ", el("code", { text: w.fix })));
+      list.append(li);
+    }
+    const meta = document.getElementById("security-meta");
+    meta.replaceChildren();
+    for (const line of sec.blacklists || []) meta.append(el("div", { text: `Spam blacklists: ${line}` }));
+    if (sec.enabled && !(sec.blacklists || []).length) meta.append(el("div", { text: "Spam blacklists: no IP to check (enable vps or add security.extra_ips)" }));
+    meta.append(el("div", { text: `Google Safe Browsing: ${sec.safe_browsing || "off (needs GOOGLE_SAFE_BROWSING_KEY)"}` }));
+    meta.append(el("div", { text: `Server checks over SSH (miners, new PHP files, SSH attacks, outbound spam): ${sec.ssh_checks ? "on" : "off (needs vps.ssh)"}` }));
+    if (sec.ts) meta.append(el("div", { text: `Last checked ${fmtTime(sec.ts)}` }));
+  }
+
   function renderSites(sites, history) {
     const body = document.getElementById("sites");
     body.replaceChildren();
@@ -415,6 +454,7 @@ select { font: inherit; color: var(--text); background: var(--surface); border: 
     banner.textContent = down.length ? `${down.length} site(s) down: ${down.map(s => s.name).join(", ")}` : "";
     document.title = down.length ? `(${down.length} down) Site Monitor` : "Site Monitor";
     renderVps(st.vps);
+    renderSecurity(st.security);
     renderSelect(st.sites);
     renderSites(st.sites, state.history);
     renderChart();

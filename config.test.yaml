@@ -18,6 +18,11 @@ alerts:
 daily_report:
   enabled: false
 
+security:
+  # 127.0.0.2 is the standard TEST address that every spam blacklist lists on purpose,
+  # so you can see what a "your server is blacklisted" warning looks like.
+  extra_ips: ["127.0.0.2"]
+
 dashboard:
   enabled: true
   host: 127.0.0.1

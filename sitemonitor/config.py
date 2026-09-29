@@ -143,6 +143,38 @@ class DashboardConfig:
 
 
 @dataclass
+class SecurityConfig:
+    """Early warning of the 'malicious activity' that gets VPS accounts suspended."""
+
+    enabled: bool = True
+    # Spam blacklists (DNSBL) for the VPS IP - free, no account, no SSH.
+    blacklist_check: bool = True
+    blacklists: list[str] = field(default_factory=lambda: [
+        "zen.spamhaus.org", "bl.spamcop.net", "psbl.surriel.com", "dnsbl-1.uceprotect.net",
+    ])
+    blacklist_interval_minutes: int = 60
+    extra_ips: list[str] = field(default_factory=list)  # other IPs to check, e.g. a mail server
+    # Google Safe Browsing - needs GOOGLE_SAFE_BROWSING_KEY in .env.
+    safe_browsing: bool = False
+    safe_browsing_interval_minutes: int = 60
+    safe_browsing_key: str | None = None
+    # Over SSH (only when vps.ssh is configured).
+    cpu_process_percent: float = 80.0
+    known_processes: list[str] = field(default_factory=lambda: [
+        "nginx", "apache2", "httpd", "php*", "mysqld", "mariadbd", "mysql", "postgres*", "redis-server",
+        "memcached", "mongod", "node", "nodejs", "PM2*", "pm2*", "dockerd", "containerd*", "java", "python*",
+        "gunicorn", "uwsgi", "ruby", "puma", "sshd", "systemd*", "kworker*", "ksoftirqd*", "jbd2*", "cron",
+        "clamd", "clamscan", "freshclam", "maldet", "apt*", "dpkg", "unattended-upgr*", "snapd",
+        "fail2ban-server", "certbot", "composer", "wp", "tar", "gzip", "rsync",
+    ])
+    web_roots: list[str] = field(default_factory=lambda: ["/var/www"])
+    php_watch_minutes: int = 60
+    php_watch_ignore: list[str] = field(default_factory=lambda: ["*/cache/*", "*/wp-content/upgrade/*"])
+    failed_ssh_logins_per_hour: int = 100
+    outbound_smtp_connections: int = 20
+
+
+@dataclass
 class GeneralConfig:
     check_interval_minutes: int = 5
     max_workers: int = 20
@@ -163,6 +195,7 @@ class Config:
     dashboard: DashboardConfig
     sites: list[SiteConfig]
     vps: VpsConfig | None = None
+    security: SecurityConfig = field(default_factory=SecurityConfig)
     base_dir: Path = Path(".")
     warnings: list[str] = field(default_factory=list)  # features switched off because of missing settings
 
@@ -343,5 +376,18 @@ def load_config(path: str | os.PathLike[str] = "config.yaml", env_file: str | No
     if dupes:
         raise ConfigError(f"Duplicate site names: {', '.join(sorted(dupes))}")
 
+    # --- security (early warning of "malicious activity")
+    sec_raw = _section(raw, "security")
+    if "safe_browsing_key" in sec_raw:
+        raise ConfigError("Put the Safe Browsing key in .env as GOOGLE_SAFE_BROWSING_KEY, not in config.yaml")
+    security = SecurityConfig(**_pick(sec_raw, SecurityConfig, "security"))
+    for name in ("blacklists", "extra_ips", "known_processes", "web_roots", "php_watch_ignore"):
+        setattr(security, name, [str(v).strip() for v in _as_list(getattr(security, name)) if str(v).strip()])
+    if security.enabled and security.safe_browsing:
+        security.safe_browsing_key = _env("GOOGLE_SAFE_BROWSING_KEY")
+        if not security.safe_browsing_key:
+            warnings.append("Google Safe Browsing off: missing GOOGLE_SAFE_BROWSING_KEY in .env")
+
     return Config(general=general, thresholds=thresholds, alerts=alerts, daily_report=daily,
-                  dashboard=dashboard, sites=sites, vps=vps, base_dir=base, warnings=warnings)
+                  dashboard=dashboard, sites=sites, vps=vps, security=security, base_dir=base,
+                  warnings=warnings)

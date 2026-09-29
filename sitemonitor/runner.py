@@ -11,7 +11,8 @@ from typing import Any, TypeVar
 from .alerts import AlertEvent, AlertManager, Notifier
 from .checks import SiteCheckResult, VpsReachability, WhoisLookup, check_site, check_vps_ports
 from .config import Config, SiteConfig
-from .diagnosis import DOWN, Diagnosis, Warn, diagnose, is_failing, vps_warnings
+from .diagnosis import DOWN, UP, WARNING, Diagnosis, Warn, diagnose, is_failing, vps_warnings
+from .security import SecurityChecker
 from .ssh_stats import VpsStats, collect_stats, fetch_error_logs
 from .storage import Storage
 
@@ -26,7 +27,8 @@ class CycleResult:
     diagnoses: list[Diagnosis]
     reach: VpsReachability | None = None
     stats: VpsStats | None = None
-    vps_warnings: list[Warn] = field(default_factory=list)
+    vps_warnings: list[Warn] = field(default_factory=list)  # server health + security warnings
+    security: dict[str, Any] = field(default_factory=dict)  # human-readable security status
     events: list[AlertEvent] = field(default_factory=list)
     alerts_delivered: bool | None = None
     duration: float = 0.0
@@ -56,6 +58,9 @@ class Monitor:
         self.whois = WhoisLookup(storage)
         self.alerts = AlertManager(storage, cfg.alerts)
         self.notifier = notifier or Notifier(cfg.alerts, cfg.general.timezone)
+        self.security = SecurityChecker(cfg)
+        # Alert key for server-level warnings (works even without a VPS, e.g. security.extra_ips).
+        self.server_key = cfg.vps.name if cfg.vps else "Server"
         self.last_cycle: CycleResult | None = None
         self._cycle_lock = threading.Lock()
 
@@ -79,7 +84,8 @@ class Monitor:
 
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="check") as ex:
             reach_f = ex.submit(check_vps_ports, vps) if vps else None
-            stats_f = ex.submit(collect_stats, vps.host, vps.ssh) if vps and vps.ssh else None
+            stats_f = ex.submit(collect_stats, vps.host, vps.ssh, self.cfg.security) if vps and vps.ssh else None
+            security_f = ex.submit(self.security.refresh, started)  # blacklists / Safe Browsing (cached)
             site_fs = [(s, ex.submit(check_site, s, self.whois, self.cfg.general.user_agent)) for s in sites]
             results = []
             for site, fut in site_fs:
@@ -88,6 +94,7 @@ class Monitor:
                                                       error_kind="internal", error_message="check crashed"))
             reach = _safe_result(reach_f, "VPS port check")
             stats = _safe_result(stats_f, "VPS stats")
+            _safe_result(security_f, "Security lookups")
 
         logs_by_site = self._error_logs(sites, results, reach, stats)
         th = self.cfg.thresholds
@@ -101,9 +108,21 @@ class Monitor:
                 diagnoses.append(Diagnosis(site=r.site, url=r.url, status=DOWN if is_failing(r) else "up",
                                            cause_code="diagnosis_error", cause=f"Could not diagnose: {exc}"))
         vps_warns = vps_warnings(stats, reach, th) if vps else []
+        security_status: dict[str, Any] = {}
+        try:
+            vps_warns += self.security.server_warnings(stats)
+            flagged = self.security.site_warnings()
+            for d in diagnoses:
+                if d.site in flagged:
+                    d.warnings += flagged[d.site]
+                    if d.status == UP:
+                        d.status = WARNING
+            security_status = self.security.summary()
+        except Exception:  # noqa: BLE001 - security checks must never break the site checks
+            log.exception("Security evaluation failed")
 
         cycle = CycleResult(ts=started, results=results, diagnoses=diagnoses, reach=reach, stats=stats,
-                            vps_warnings=vps_warns)
+                            vps_warnings=vps_warns, security=security_status)
         if save:
             self._save(cycle)
         if alert:
@@ -161,6 +180,10 @@ class Monitor:
                 self.storage.record_vps(
                     cycle.ts, cycle.reach.reachable, cycle.reach.ports,
                     st.to_dict() if st and st.ok else None, st.error if st and not st.ok else None)
+            # Latest server/security warnings for the dashboard and daily report.
+            self.storage.set_kv("server_status", {
+                "ts": cycle.ts, "name": self.server_key, "security": cycle.security,
+                "warnings": [w.__dict__ for w in cycle.vps_warnings]})
         except Exception:  # noqa: BLE001
             log.exception("Saving check results failed")
 
@@ -174,8 +197,7 @@ class Monitor:
                 events += self.alerts.evaluate_site(site_id, d, cycle.ts)
                 if d.status != DOWN:  # a DOWN alert already lists everything that matters
                     events += self.alerts.evaluate_warnings(d.site, d.warnings, cycle.ts)
-            if self.cfg.vps:
-                events += self.alerts.evaluate_warnings(self.cfg.vps.name, cycle.vps_warnings, cycle.ts)
+            events += self.alerts.evaluate_warnings(self.server_key, cycle.vps_warnings, cycle.ts)
         except Exception:  # noqa: BLE001
             log.exception("Alert evaluation failed")
         cycle.events = events

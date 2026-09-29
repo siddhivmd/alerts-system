@@ -150,9 +150,10 @@ def monitor(cfg, monkeypatch):
     monkeypatch.setattr(runner_mod, "check_site", fake_check_site)
     monkeypatch.setattr(runner_mod, "check_vps_ports", lambda vps: reach(p22=True, p80=True, p443=True))
     stats = healthy_stats(services={"nginx": {"active": "failed", "sub": "failed", "enabled": "enabled"}})
-    monkeypatch.setattr(runner_mod, "collect_stats", lambda host, ssh: stats)
+    monkeypatch.setattr(runner_mod, "collect_stats", lambda host, ssh, security=None: stats)
     monkeypatch.setattr(runner_mod, "fetch_error_logs",
                         lambda host, ssh, paths: {"/var/log/nginx/error.log": ["[emerg] bind() failed"]})
+    cfg.security.blacklist_check = False  # no real DNS lookups in tests (covered in test_security.py)
     m = Monitor(cfg, Storage(cfg.general.database), notifier=Recorder())
     m.test_state = state
     return m
