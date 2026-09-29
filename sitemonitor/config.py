@@ -4,6 +4,11 @@ Non-secret settings live in ``config.yaml``. Secrets are read only from the
 environment (typically populated from a ``.env`` file next to the config):
 
     SMTP_PASSWORD, TELEGRAM_BOT_TOKEN, DASHBOARD_PASSWORD, SSH_KEY_PASSPHRASE
+
+Every feature is optional. A section that is missing, or has ``enabled: false``,
+is simply off. A feature that is enabled but lacks a required value or secret
+is switched off with a warning (``Config.warnings``) instead of stopping the
+monitor. Real mistakes - unknown keys, invalid values - still raise ConfigError.
 """
 from __future__ import annotations
 
@@ -94,10 +99,10 @@ class VpsConfig:
 
 @dataclass
 class EmailConfig:
-    host: str
-    port: int
-    from_addr: str
-    to: list[str]
+    host: str = ""
+    port: int | None = None  # default: 465 for ssl, 587 for starttls, 25 for none
+    from_addr: str | None = None  # default: username
+    to: list[str] = field(default_factory=list)
     username: str | None = None
     password: str | None = None
     security: str = "ssl"  # ssl | starttls | none
@@ -116,6 +121,7 @@ class AlertsConfig:
     consecutive_failures: int = 2
     throttle_minutes: int = 30
     warning_repeat_hours: int = 24
+    console: bool = False  # also write alert messages to the log/console (handy for testing)
     email: EmailConfig | None = None
     telegram: TelegramConfig | None = None
 
@@ -158,6 +164,7 @@ class Config:
     sites: list[SiteConfig]
     vps: VpsConfig | None = None
     base_dir: Path = Path(".")
+    warnings: list[str] = field(default_factory=list)  # features switched off because of missing settings
 
 
 # --------------------------------------------------------------------------- helpers
@@ -246,20 +253,30 @@ def load_config(path: str | os.PathLike[str] = "config.yaml", env_file: str | No
     thresholds = Thresholds(**_pick(_section(raw, "thresholds"), Thresholds, "thresholds"))
 
     # --- VPS
+    warnings: list[str] = []
     vps: VpsConfig | None = None
     vps_raw = _section(raw, "vps")
-    if vps_raw.get("host"):
+    vps_enabled = vps_raw.pop("enabled", True)
+    if vps_enabled and not vps_raw.get("host"):
+        if vps_raw:
+            warnings.append("VPS checks off: vps.host is not set")
+    elif vps_enabled:
         ssh_raw = vps_raw.pop("ssh", None)
         vps = VpsConfig(**_pick(vps_raw, VpsConfig, "vps"))
         vps.ports = [int(p) for p in vps.ports]
-        if ssh_raw and ssh_raw.get("enabled", True) and ssh_raw.get("user") and ssh_raw.get("key_file"):
+        if ssh_raw and ssh_raw.get("enabled", True) and not (ssh_raw.get("user") and ssh_raw.get("key_file")):
+            warnings.append("SSH stats off: vps.ssh needs both 'user' and 'key_file'")
+        elif ssh_raw and ssh_raw.get("enabled", True):
             ssh_raw = {k: v for k, v in ssh_raw.items() if k != "enabled"}
             ssh = SshConfig(**_pick(ssh_raw, SshConfig, "vps.ssh"))
             ssh.key_file = _resolve(base, ssh.key_file)
             ssh.known_hosts = _resolve(base, ssh.known_hosts) if ssh.known_hosts else str(
                 Path(general.database).parent / "known_hosts")
             ssh.key_passphrase = _env("SSH_KEY_PASSPHRASE")
-            vps.ssh = ssh
+            if Path(ssh.key_file).exists():
+                vps.ssh = ssh
+            else:
+                warnings.append(f"SSH stats off: key file not found: {ssh.key_file}")
 
     # --- alerts
     alerts_raw = _section(raw, "alerts")
@@ -277,37 +294,54 @@ def load_config(path: str | os.PathLike[str] = "config.yaml", env_file: str | No
         email.username = email.username or _env("SMTP_USERNAME")
         if email.security not in ("ssl", "starttls", "none"):
             raise ConfigError("alerts.email.security must be ssl, starttls or none")
-        if not email.to:
-            raise ConfigError("alerts.email.to needs at least one recipient")
-        alerts.email = email
+        email.port = int(email.port or {"ssl": 465, "starttls": 587, "none": 25}[email.security])
+        email.from_addr = email.from_addr or email.username
+        missing = [name for name, ok in (
+            ("alerts.email.host", email.host), ("alerts.email.to", email.to),
+            ("alerts.email.from_addr (or username)", email.from_addr),
+            ("SMTP_PASSWORD in .env", email.password or not email.username)) if not ok]
+        if missing:
+            warnings.append(f"Email alerts off: missing {', '.join(missing)}")
+        else:
+            alerts.email = email
 
     if tg_raw.get("enabled", False):
         token = _env("TELEGRAM_BOT_TOKEN")
-        if not token:
-            raise ConfigError("Telegram is enabled but TELEGRAM_BOT_TOKEN is not set in .env")
         chat_ids = [str(c) for c in _as_list(tg_raw.get("chat_ids"))]
-        if not chat_ids:
-            raise ConfigError("alerts.telegram.chat_ids needs at least one chat id")
-        alerts.telegram = TelegramConfig(bot_token=token, chat_ids=chat_ids,
-                                         timeout=float(tg_raw.get("timeout", 15)))
+        missing = [name for name, ok in (("TELEGRAM_BOT_TOKEN in .env", token),
+                                         ("alerts.telegram.chat_ids", chat_ids)) if not ok]
+        if missing:
+            warnings.append(f"Telegram alerts off: missing {', '.join(missing)}")
+        else:
+            alerts.telegram = TelegramConfig(bot_token=token, chat_ids=chat_ids,
+                                             timeout=float(tg_raw.get("timeout", 15)))
 
     daily = DailyReportConfig(**_pick(_section(raw, "daily_report"), DailyReportConfig, "daily_report"))
     if not _TIME_RE.match(daily.time):
         raise ConfigError(f"daily_report.time must be HH:MM, got {daily.time!r}")
+    daily.channels = [str(c).strip().lower() for c in _as_list(daily.channels)]
+    bad = [c for c in daily.channels if c not in ("email", "telegram", "console")]
+    if bad:
+        raise ConfigError(f"daily_report.channels takes channel names (email, telegram, console), not {bad}. "
+                          "Recipients go under alerts.email.to")
 
     dashboard = DashboardConfig(**_pick(_section(raw, "dashboard"), DashboardConfig, "dashboard"))
     dashboard.password = _env("DASHBOARD_PASSWORD")
+    if dashboard.enabled and not dashboard.password and dashboard.host not in ("127.0.0.1", "localhost"):
+        warnings.append(f"Dashboard has no DASHBOARD_PASSWORD: serving without login on 127.0.0.1 only "
+                        f"(not {dashboard.host})")
+        dashboard.host = "127.0.0.1"
 
     # --- sites
     defaults = _section(raw, "defaults")
     defaults.setdefault("slow_threshold_ms", 3000)
     sites = [_build_site(s, defaults, i) for i, s in enumerate(raw.get("sites") or [])]
-    if not sites:
-        raise ConfigError("No sites configured under 'sites'")
+    if not sites and not vps:
+        raise ConfigError("Nothing to monitor: add at least one entry under 'sites' or enable 'vps'")
     names = [s.name for s in sites]
     dupes = {n for n in names if names.count(n) > 1}
     if dupes:
         raise ConfigError(f"Duplicate site names: {', '.join(sorted(dupes))}")
 
     return Config(general=general, thresholds=thresholds, alerts=alerts, daily_report=daily,
-                  dashboard=dashboard, sites=sites, vps=vps, base_dir=base)
+                  dashboard=dashboard, sites=sites, vps=vps, base_dir=base, warnings=warnings)

@@ -34,6 +34,8 @@ def _load(args: argparse.Namespace) -> Config:
         print(f"Configuration error: {exc}", file=sys.stderr)
         sys.exit(2)
     setup_logging(cfg.general.log_file, "DEBUG" if args.verbose else cfg.general.log_level)
+    for warning in cfg.warnings:
+        log.warning("Config: %s", warning)
     return cfg
 
 
@@ -121,12 +123,16 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 def cmd_test_alerts(args: argparse.Namespace) -> int:
     cfg = _load(args)
+    for warning in cfg.warnings:
+        if "alerts off" in warning:
+            print(f"skipped   {warning}")
     results = Notifier(cfg.alerts, cfg.general.timezone).test()
     if not results:
-        print("No alert channels are enabled. Enable alerts.email and/or alerts.telegram in config.yaml.")
+        print("No alert channels are enabled. Enable alerts.email, alerts.telegram or alerts.console in config.yaml.")
         return 1
     for channel, error in results.items():
-        print(f"{channel:<9} {'OK - check your inbox/chat' if error is None else 'FAILED: ' + error}")
+        ok = "OK - printed above" if channel == "console" else "OK - check your inbox/chat"
+        print(f"{channel:<9} {ok if error is None else 'FAILED: ' + error}")
     return 0 if all(e is None for e in results.values()) else 1
 
 
@@ -166,17 +172,15 @@ def cmd_run(args: argparse.Namespace) -> int:
              len(cfg.sites), cfg.general.check_interval_minutes, cfg.vps.host if cfg.vps else "none",
              bool(cfg.vps and cfg.vps.ssh), bool(cfg.alerts.email), bool(cfg.alerts.telegram))
     if not cfg.alerts.email and not cfg.alerts.telegram:
-        log.warning("No alert channels enabled - problems will only show in the log and dashboard")
+        log.warning("No email/Telegram alerts enabled - problems will only show in the log%s and dashboard",
+                    " (console alerts on)" if cfg.alerts.console else "")
     sched.start()
     try:
         dash = cfg.dashboard
         if dash.enabled and not args.no_dashboard:
-            if not dash.password:
-                log.error("Dashboard disabled: set DASHBOARD_PASSWORD in .env to enable it")
-            else:
-                app = create_app(cfg, storage, lambda: monitor.last_cycle.ts if monitor.last_cycle else None)
-                serve(app, dash.host, dash.port)
-                return 0
+            app = create_app(cfg, storage, lambda: monitor.last_cycle.ts if monitor.last_cycle else None)
+            serve(app, dash.host, dash.port)
+            return 0
         stop.wait()
     except (KeyboardInterrupt, SystemExit):
         pass

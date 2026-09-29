@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import logging.handlers
+import sys
 from pathlib import Path
 
 _FORMAT = "%(asctime)s %(levelname)-7s %(name)s [%(threadName)s] %(message)s"
@@ -17,6 +18,13 @@ def setup_logging(log_file: str | None, level: str = "INFO", max_bytes: int = 5 
         root.removeHandler(handler)
 
     formatter = logging.Formatter(_FORMAT)
+    # Windows consoles often use cp1252: never let an emoji in an alert crash a log call.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(errors="replace")
+            except (ValueError, OSError):
+                pass
     console = logging.StreamHandler()
     console.setFormatter(formatter)
     root.addHandler(console)

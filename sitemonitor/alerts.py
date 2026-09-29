@@ -277,12 +277,21 @@ class TelegramChannel:
             raise RuntimeError("; ".join(errors))
 
 
+class ConsoleChannel:
+    """Writes alerts to the log (and console). Lets you see real alert text without SMTP/Telegram."""
+
+    name = "console"
+
+    def send(self, subject: str, text: str) -> None:
+        log.warning("ALERT MESSAGE: %s\n%s", subject, text)
+
+
 class Notifier:
     """Deliver batched events over all configured channels."""
 
     def __init__(self, cfg: AlertsConfig, tz_name: str = "UTC", channels: list[Channel] | None = None) -> None:
         if channels is None:
-            channels = []
+            channels = [ConsoleChannel()] if cfg.console else []
             if cfg.email:
                 channels.append(EmailChannel(cfg.email))
             if cfg.telegram:

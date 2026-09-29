@@ -78,6 +78,34 @@ python monitor.py test-alerts                     # sends a test email / Telegra
 python monitor.py run                             # scheduler + dashboard (http://host:8080)
 ```
 
+### Try it first, with no setup
+
+`config.test.yaml` works immediately. It needs no secrets, no VPS and no email. It checks public websites, several of them broken on purpose, and prints alerts to the console instead of sending them:
+
+```bash
+python monitor.py -c config.test.yaml check            # see every diagnosis once
+python monitor.py -c config.test.yaml check --alert    # run twice: the 2nd run prints the alert message
+python monitor.py -c config.test.yaml run              # dashboard at http://127.0.0.1:8080, checks every minute
+```
+
+It uses its own database (`data/test.db`), so test history never mixes with real data.
+
+### Everything is optional
+
+The minimum config is **one site**. Everything else can be switched on later, one piece at a time:
+
+| Feature | How to switch it on | If a required setting is missing |
+|---|---|---|
+| VPS port checks | `vps.enabled: true` and `vps.host` | Skipped with a warning |
+| VPS stats over SSH | `vps.ssh.enabled: true`, plus `user` and an existing `key_file` | Skipped with a warning; the external checks still run |
+| Email alerts | `alerts.email.enabled: true`, plus `host`, `to` and `SMTP_PASSWORD` | Skipped with a warning |
+| Telegram alerts | `alerts.telegram.enabled: true`, plus `chat_ids` and `TELEGRAM_BOT_TOKEN` | Skipped with a warning |
+| Console alerts | `alerts.console: true`. Alert text is written to the log; good for testing | Nothing needed |
+| Daily report | `daily_report.enabled: true` | Logged if no listed channel is on |
+| Dashboard login | `DASHBOARD_PASSWORD` in `.env` | The dashboard still runs, **without a login, on 127.0.0.1 only** |
+
+Skipped features are listed at startup as `Config: ... off: missing ...`. Only genuine mistakes stop the monitor, such as an unknown key, a bad URL, or a time that isn't HH:MM. For email, `port` defaults from `security` (465 for `ssl`, 587 for `starttls`), and `from_addr` defaults to `username`.
+
 ### Commands
 
 | Command | What it does |
@@ -98,15 +126,15 @@ Global options: `-c/--config PATH`, `--env-file PATH`, `-v` (debug logging).
 | `general` | `check_interval_minutes` (5), `timezone`, `database`, `log_file`, `retention_days` (90) |
 | `thresholds` | `ram_percent` (90), `disk_percent` (95), `disk_warn_percent` (85), `cpu_load_per_core` (2.0), `ssl_warn_days` (14), `ssl_critical_days` (3), `domain_warn_days` (30) |
 | `defaults` | Applied to every site: `timeout`, `slow_threshold_ms`, `follow_redirects`, `check_ssl`, `check_domain` |
-| `vps` | `host`, `ports`, and the optional `ssh` block (user, key, services, error logs) |
-| `alerts` | `consecutive_failures` (2), `throttle_minutes` (30), `warning_repeat_hours` (24), plus the `email` and `telegram` blocks, each with `enabled` |
-| `daily_report` | `enabled`, `time` ("09:00"), `channels` |
+| `vps` | `enabled`, `host`, `ports`, and the optional `ssh` block (enabled, user, key, services, error logs) |
+| `alerts` | `consecutive_failures` (2), `throttle_minutes` (30), `warning_repeat_hours` (24), `console` (false), plus the `email` and `telegram` blocks, each with `enabled` |
+| `daily_report` | `enabled`, `time` ("09:00"), `channels` (any of email, telegram, console) |
 | `dashboard` | `enabled`, `host`, `port`, `username` |
 | `sites[]` | `name`, `url`, plus any of: `keyword`, `forbidden_keywords`, `timeout`, `expected_status`, `headers`, `follow_redirects`, `max_redirects`, `slow_threshold_ms`, `check_ssl`, `check_domain`, `domain`, `on_vps`, `error_log`, `verify_ssl` |
 
 Set `on_vps: false` for sites hosted somewhere else. They skip the VPS-based diagnosis.
 
-**Secrets live only in `.env`** and are never read from `config.yaml`: `SMTP_PASSWORD`, `TELEGRAM_BOT_TOKEN`, `DASHBOARD_PASSWORD` and `SSH_KEY_PASSPHRASE`. The dashboard won't start without a password.
+**Secrets live only in `.env`** and are never read from `config.yaml`: `SMTP_PASSWORD`, `TELEGRAM_BOT_TOKEN`, `DASHBOARD_PASSWORD` and `SSH_KEY_PASSPHRASE`. All of them are optional; see "Everything is optional" above.
 
 ### Email
 
@@ -246,5 +274,5 @@ Dockerfile, docker-compose.yml
 | Every site shows "VPS unreachable" but the VPS is fine | The monitor's own network is down, or the VPS firewall blocks the monitor's IP. Allow it, or check `vps.host` |
 | "SSH authentication failed" | Wrong `user` or `key_file`, or the public key isn't in `authorized_keys` |
 | "WHOIS returned no expiry date" | Some TLDs (e.g. many ccTLDs) hide it. Set `check_domain: false` for that site |
-| Dashboard log says "Dashboard disabled" | `DASHBOARD_PASSWORD` is missing from `.env` |
+| Dashboard only opens on the monitor machine itself | No `DASHBOARD_PASSWORD` in `.env`, so it's limited to 127.0.0.1. Set a password to allow other machines |
 | HTTP 429 or 403 only from the monitor | The site's firewall or WAF is rate-limiting the monitor. Allowlist its IP |

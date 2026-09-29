@@ -1,12 +1,15 @@
 """Config loading, a full runner cycle with mocked network, and the dashboard API."""
 import base64
 import textwrap
+from pathlib import Path
 
 import pytest
 from conftest import healthy_stats, ok_result, reach
 
 from sitemonitor import runner as runner_mod
-from sitemonitor.config import ConfigError, load_config
+from sitemonitor.alerts import AlertEvent, Notifier
+from sitemonitor.config import AlertsConfig, ConfigError, load_config
+from sitemonitor.diagnosis import Warn
 from sitemonitor.dashboard import create_app
 from sitemonitor.runner import Monitor
 from sitemonitor.storage import Storage
@@ -29,6 +32,7 @@ sites:
 def cfg(tmp_path, monkeypatch):
     monkeypatch.setenv("DASHBOARD_PASSWORD", "s3cret")
     (tmp_path / "config.yaml").write_text(CONFIG)
+    (tmp_path / "key").write_text("dummy")  # SSH is switched off when the key file is missing
     return load_config(tmp_path / "config.yaml", env_file=str(tmp_path / "missing.env"))
 
 
@@ -41,18 +45,85 @@ def test_config_defaults_and_secrets(cfg, tmp_path):
 
 
 @pytest.mark.parametrize("bad, msg", [
-    ("sites: []", "No sites"),
+    ("sites: []", "Nothing to monitor"),
     ("sites: [{name: A, url: ftp://x}]", "url must be"),
     ("sites: [{name: A, url: 'https://a'}, {name: A, url: 'https://b'}]", "Duplicate"),
     ("sites: [{name: A, url: 'https://a', keywrd: x}]", "Unknown key"),
     ("daily_report: {time: '25:00'}\nsites: [{name: A, url: 'https://a'}]", "HH:MM"),
-    ("alerts: {telegram: {enabled: true, chat_ids: [1]}}\nsites: [{name: A, url: 'https://a'}]", "TELEGRAM_BOT_TOKEN"),
+    ("alerts: {email: {enabled: true, security: tls}}\nsites: [{name: A, url: 'https://a'}]", "security"),
+    ("daily_report: {channels: [me@gmail.com]}\nsites: [{name: A, url: 'https://a'}]", "not a channel|channel names"),
 ])
 def test_config_errors(tmp_path, monkeypatch, bad, msg):
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
     (tmp_path / "c.yaml").write_text(textwrap.dedent(bad))
     with pytest.raises(ConfigError, match=msg):
         load_config(tmp_path / "c.yaml", env_file=str(tmp_path / "none.env"))
+
+
+def _load(tmp_path, text):
+    (tmp_path / "c.yaml").write_text(textwrap.dedent(text))
+    return load_config(tmp_path / "c.yaml", env_file=str(tmp_path / "none.env"))
+
+
+SECRETS = ("TELEGRAM_BOT_TOKEN", "SMTP_PASSWORD", "SMTP_USERNAME", "DASHBOARD_PASSWORD")
+
+
+def test_minimal_config_is_one_site(tmp_path, monkeypatch):
+    for name in SECRETS:
+        monkeypatch.delenv(name, raising=False)
+    cfg = _load(tmp_path, "sites: [{name: A, url: 'https://a.example.com'}]")
+    assert cfg.vps is None and cfg.alerts.email is None and cfg.alerts.telegram is None
+    assert cfg.dashboard.host == "127.0.0.1"          # no password -> local only, no login
+    assert any("Dashboard has no DASHBOARD_PASSWORD" in w for w in cfg.warnings)
+
+
+def test_enabled_features_missing_secrets_are_switched_off_not_fatal(tmp_path, monkeypatch):
+    for name in SECRETS:
+        monkeypatch.delenv(name, raising=False)
+    cfg = _load(tmp_path, """
+        vps:
+          host: 1.2.3.4
+          ssh: {user: mon, key_file: does-not-exist}
+        alerts:
+          email: {enabled: true, host: smtp.test, username: me@test, to: [a@test]}
+          telegram: {enabled: true, chat_ids: [1]}
+        sites: [{name: A, url: 'https://a.example.com'}]
+    """)
+    assert cfg.vps is not None and cfg.vps.ssh is None
+    assert cfg.alerts.email is None and cfg.alerts.telegram is None
+    joined = " | ".join(cfg.warnings)
+    assert "SSH stats off: key file not found" in joined
+    assert "Email alerts off: missing SMTP_PASSWORD" in joined
+    assert "Telegram alerts off: missing TELEGRAM_BOT_TOKEN" in joined
+
+
+def test_email_defaults_port_and_sender(tmp_path, monkeypatch):
+    monkeypatch.setenv("SMTP_PASSWORD", "pw")
+    cfg = _load(tmp_path, """
+        alerts: {email: {enabled: true, host: smtp.test, security: starttls, username: me@test, to: a@test}}
+        sites: [{name: A, url: 'https://a.example.com'}]
+    """)
+    email = cfg.alerts.email
+    assert (email.port, email.from_addr, email.to) == (587, "me@test", ["a@test"])
+
+
+def test_vps_only_and_disabled_vps(tmp_path):
+    assert _load(tmp_path, "vps: {host: 1.2.3.4}").sites == []
+    with pytest.raises(ConfigError, match="Nothing to monitor"):
+        _load(tmp_path, "vps: {enabled: false, host: 1.2.3.4}")
+
+
+def test_shipped_configs_load():
+    root = Path(__file__).resolve().parent.parent
+    for name in ("config.example.yaml", "config.test.yaml"):
+        assert load_config(root / name, env_file=str(root / "no-such.env")).sites
+
+
+def test_console_channel_delivers(caplog):
+    notifier = Notifier(AlertsConfig(console=True))
+    with caplog.at_level("WARNING"):
+        assert notifier.dispatch([AlertEvent(kind="warning", key="A", ts=0, warning=Warn("slow", "Slow: 4000 ms"))])
+    assert "Slow: 4000 ms" in caplog.text
 
 
 class Recorder:
@@ -125,3 +196,9 @@ def test_dashboard_requires_auth_and_serves_status(cfg, monitor):
     assert client.get("/", headers=good).status_code == 200
     assert "A" in client.get("/api/history", headers=good).get_json()["sites"]
     assert client.get("/healthz").get_json()["ok"] is True
+
+
+def test_dashboard_without_password_needs_no_login(cfg, monitor):
+    cfg.dashboard.password = None
+    client = create_app(cfg, monitor.storage).test_client()
+    assert client.get("/api/status").status_code == 200

@@ -29,6 +29,10 @@ def _requires_auth(cfg: Config) -> Callable[[Callable[..., Any]], Callable[..., 
     password = cfg.dashboard.password or ""
 
     def decorator(view: Callable[..., Any]) -> Callable[..., Any]:
+        if not password:
+            # No password configured: config.py already limited the dashboard to 127.0.0.1.
+            return view
+
         @wraps(view)
         def wrapped(*args: Any, **kwargs: Any) -> Any:
             auth = request.authorization

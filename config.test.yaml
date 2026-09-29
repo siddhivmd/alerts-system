@@ -1,0 +1,59 @@
+# Ready-to-run TEST configuration: public websites only, no secrets needed.
+#   python monitor.py -c config.test.yaml check     one-off check
+#   python monitor.py -c config.test.yaml run       scheduler + dashboard on http://127.0.0.1:8080
+# Some sites below are broken ON PURPOSE, to show each diagnosis.
+# Nothing here touches your VPS, and no email/Telegram is sent (alerts go to the console).
+
+general:
+  check_interval_minutes: 1       # fast, so you can watch alerts and recovery happen
+  database: data/test.db          # separate from the real monitor.db
+  log_file: logs/test.log
+  timezone: Asia/Kolkata
+
+alerts:
+  consecutive_failures: 2
+  throttle_minutes: 30
+  console: true                   # alert messages are printed instead of sent
+
+daily_report:
+  enabled: false
+
+dashboard:
+  enabled: true
+  host: 127.0.0.1
+  port: 8080
+
+# Optional: uncomment to simulate a dead/suspended VPS (192.0.2.1 is a never-routable test IP).
+# vps:
+#   name: Test VPS
+#   host: 192.0.2.1
+#   port_timeout: 3
+
+sites:
+  - name: Healthy site
+    url: https://example.com
+    keyword: "Example Domain"
+
+  - name: Healthy with redirect
+    url: http://github.com        # redirects to https; followed automatically
+    keyword: "GitHub"
+    slow_threshold_ms: 5000
+
+  - name: "Broken: domain does not exist"
+    url: https://this-domain-does-not-exist-9f3k2.com
+
+  - name: "Broken: HTTP 500"
+    url: https://httpbin.org/status/500
+
+  - name: "Broken: SSL expired"
+    url: https://expired.badssl.com
+
+  - name: "Broken: keyword missing"
+    url: https://example.com
+    keyword: "Login"
+    check_domain: false
+
+  - name: "Broken: slow response"
+    url: https://httpbin.org/delay/3   # answers after ~3 s
+    slow_threshold_ms: 1500            # -> "slow" warning, site still counts as up
+    check_domain: false

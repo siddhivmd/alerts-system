@@ -1,6 +1,11 @@
 # Site monitor configuration. Copy to config.yaml and edit.
 # Secrets (passwords, tokens) are NOT set here - put them in .env (see .env.example).
 # Relative paths are resolved against the folder that contains this file.
+#
+# EVERYTHING IS OPTIONAL. Each feature has "enabled:"; turn features on one at a time.
+# If a feature is enabled but a required value or secret is missing, it is switched
+# off with a warning at startup - the rest keeps running. Minimum config: one site.
+# For a ready-made test setup using public sites, see config.test.yaml.
 
 general:
   check_interval_minutes: 5      # how often every site is checked
@@ -30,12 +35,13 @@ defaults:
   check_domain: true             # WHOIS lookup (cached 24h)
 
 vps:
+  enabled: false                 # set true once host is your real VPS IP
   name: Hostinger VPS
   host: 1.2.3.4                  # your VPS IP address
   ports: [22, 80, 443]           # all closed = VPS down or ACCOUNT SUSPENDED
   port_timeout: 8
-  ssh:                           # optional. Remove or set enabled: false to run external checks only.
-    enabled: true
+  ssh:                           # optional: RAM/disk/services/error logs. Needs a key on this machine.
+    enabled: false
     user: monitor                # a dedicated low-privilege user is recommended (see README)
     port: 22
     key_file: ~/.ssh/monitor_ed25519   # passphrase (if any) goes in .env as SSH_KEY_PASSPHRASE
@@ -53,8 +59,9 @@ alerts:
   consecutive_failures: 2        # failures in a row before alerting (avoids false alarms)
   throttle_minutes: 30           # repeat a still-down alert at most this often
   warning_repeat_hours: 24       # repeat warnings (SSL/domain expiry, slow, disk) at most this often
+  console: true                  # also print alert messages to the log - useful while testing
   email:
-    enabled: true
+    enabled: false               # needs host, to, and SMTP_PASSWORD in .env
     host: smtp.gmail.com
     port: 465
     security: ssl                # ssl (port 465) | starttls (port 587) | none
@@ -64,19 +71,20 @@ alerts:
       - you@company.com
       - teammate@company.com
   telegram:
-    enabled: false               # bot token: TELEGRAM_BOT_TOKEN in .env
+    enabled: false               # needs TELEGRAM_BOT_TOKEN in .env and chat_ids
     chat_ids: ["123456789"]      # user or group chat ids (see README for how to find them)
 
 daily_report:
   enabled: true
   time: "09:00"                  # in general.timezone
-  channels: [email]              # email and/or telegram
+  channels: [email, console]     # any of: email, telegram, console
 
 dashboard:
   enabled: true
   host: 0.0.0.0
   port: 8080
-  username: admin                # password: DASHBOARD_PASSWORD in .env
+  username: admin                # password: DASHBOARD_PASSWORD in .env.
+                                 # Without it the dashboard still runs, with no login, on 127.0.0.1 only.
 
 sites:
   - name: Main Website
