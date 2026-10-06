@@ -22,7 +22,8 @@ from .checks import SiteCheckResult, VpsReachability, WhoisLookup, check_interne
 from .config import Config, SiteConfig
 from .diagnosis import DOWN, UP, WARNING, Diagnosis, Warn, diagnose, is_failing, vps_warnings
 from .heartbeat import Heartbeat
-from .security import SecurityChecker
+from .security import EXTRA_KEY, SecurityChecker
+from .trends import disk_forecast_warning
 from .ssh_stats import VpsStats, collect_stats, fetch_error_logs
 from .storage import Storage
 
@@ -33,13 +34,23 @@ MAX_OFFLINE_PERIODS = 50
 
 
 @dataclass
+class ServerResult:
+    """One monitored server in one cycle."""
+
+    name: str
+    host: str
+    reach: VpsReachability | None = None
+    stats: VpsStats | None = None
+    warnings: list[Warn] = field(default_factory=list)  # health + security + backups + disk trend
+
+
+@dataclass
 class CycleResult:
     ts: float
     results: list[SiteCheckResult]
     diagnoses: list[Diagnosis]
-    reach: VpsReachability | None = None
-    stats: VpsStats | None = None
-    vps_warnings: list[Warn] = field(default_factory=list)  # server health + security warnings
+    servers: dict[str, ServerResult] = field(default_factory=dict)
+    extra_warnings: list[Warn] = field(default_factory=list)  # e.g. blacklisted security.extra_ips
     security: dict[str, Any] = field(default_factory=dict)  # human-readable security status
     events: list[AlertEvent] = field(default_factory=list)
     alerts_delivered: bool | None = None
@@ -52,6 +63,22 @@ class CycleResult:
     @property
     def down(self) -> list[Diagnosis]:
         return [d for d in self.diagnoses if d.status == DOWN]
+
+    # Shortcuts for the common single-server setup.
+    @property
+    def reach(self) -> VpsReachability | None:
+        first = next(iter(self.servers.values()), None)
+        return first.reach if first else None
+
+    @property
+    def stats(self) -> VpsStats | None:
+        first = next(iter(self.servers.values()), None)
+        return first.stats if first else None
+
+    @property
+    def vps_warnings(self) -> list[Warn]:
+        """All server-level warnings, every server."""
+        return [w for s in self.servers.values() for w in s.warnings] + self.extra_warnings
 
 
 def _safe_result(future: Future[T] | None, what: str) -> T | None:
@@ -77,8 +104,8 @@ class Monitor:
         self.escalation_notifier = escalation_notifier(cfg.alerts, cfg.general.timezone)
         self.security = SecurityChecker(cfg)
         self.heartbeat = Heartbeat(cfg.heartbeat)
-        # Alert key for server-level warnings (works even without a VPS, e.g. security.extra_ips).
-        self.server_key = cfg.vps.name if cfg.vps else "Server"
+        if cfg.vps:  # history written before multi-server support belongs to the first server
+            storage.claim_unnamed_vps_rows(cfg.vps.name)
         self.last_cycle: CycleResult | None = None
         self._cycle_lock = threading.Lock()
 
@@ -118,13 +145,13 @@ class Monitor:
             if save:
                 self._record_online(started)
         sites = [s for s in self.cfg.sites if not only or s.name in only]
-        vps = self.cfg.vps
-        workers = max(1, min(self.cfg.general.max_workers, len(sites) + 2))
+        servers = self.cfg.servers
+        workers = max(1, min(self.cfg.general.max_workers, len(sites) + 2 * len(servers) + 1))
 
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="check") as ex:
-            reach_f = ex.submit(check_vps_ports, vps) if vps else None
-            stats_f = (ex.submit(collect_stats, vps.host, vps.ssh, self.cfg.security, self.cfg.backups)
-                       if vps and vps.ssh else None)
+            reach_fs = {n: ex.submit(check_vps_ports, sv) for n, sv in servers.items()}
+            stats_fs = {n: ex.submit(collect_stats, sv.host, sv.ssh, self.cfg.security, self.cfg.backups)
+                        for n, sv in servers.items() if sv.ssh}
             security_f = ex.submit(self.security.refresh, started)  # blacklists / Safe Browsing (cached)
             site_fs = [(s, ex.submit(check_site, s, self.whois, self.cfg.general.user_agent)) for s in sites]
             results = []
@@ -132,25 +159,37 @@ class Monitor:
                 res = _safe_result(fut, f"Check of {site.name}")
                 results.append(res or SiteCheckResult(site=site.name, url=site.url, on_vps=site.on_vps,
                                                       error_kind="internal", error_message="check crashed"))
-            reach = _safe_result(reach_f, "VPS port check")
-            stats = _safe_result(stats_f, "VPS stats")
+            server_results = {n: ServerResult(name=n, host=sv.host,
+                                              reach=_safe_result(reach_fs[n], f"Port check of {n}"),
+                                              stats=_safe_result(stats_fs.get(n), f"Stats of {n}"))
+                              for n, sv in servers.items()}
             _safe_result(security_f, "Security lookups")
 
-        logs_by_site = self._error_logs(sites, results, reach, stats)
+        server_of = {s.name: s.server for s in sites}
+        logs_by_site = self._error_logs(sites, results, server_results)
         th = self.cfg.thresholds
         diagnoses = []
         for r in results:
+            sr = server_results.get(server_of.get(r.site) or "")
             try:
-                diagnoses.append(diagnose(r, reach if r.on_vps else None, stats if r.on_vps else None, th,
+                diagnoses.append(diagnose(r, sr.reach if sr else None, sr.stats if sr else None, th,
                                           logs_by_site.get(r.site)))
             except Exception as exc:  # noqa: BLE001
                 log.exception("Diagnosis failed for %s", r.site)
                 diagnoses.append(Diagnosis(site=r.site, url=r.url, status=DOWN if is_failing(r) else "up",
                                            cause_code="diagnosis_error", cause=f"Could not diagnose: {exc}"))
-        vps_warns = vps_warnings(stats, reach, th) if vps else []
+
+        for sr in server_results.values():
+            sr.warnings = vps_warnings(sr.stats, sr.reach, th)
         security_status: dict[str, Any] = {}
+        extra: list[Warn] = []
         try:
-            vps_warns += self.security.server_warnings(stats)
+            per_server = self.security.server_warnings({n: sr.stats for n, sr in server_results.items()})
+            for name, warns in per_server.items():
+                if name in server_results:
+                    server_results[name].warnings += warns
+                else:
+                    extra += warns  # e.g. a blacklisted security.extra_ips address
             flagged = self.security.site_warnings()
             for d in diagnoses:
                 if d.site in flagged:
@@ -161,14 +200,25 @@ class Monitor:
         except Exception:  # noqa: BLE001 - security checks must never break the site checks
             log.exception("Security evaluation failed")
         try:
-            vps_warns += backup_warnings(stats, self.cfg.backups)
-            security_status["backups"] = backup_summary(stats, self.cfg.backups)
+            security_status["backups"] = []
+            for sr in server_results.values():
+                sr.warnings += backup_warnings(sr.stats, self.cfg.backups)
+                security_status["backups"] += [f"{sr.name}: {line}" if len(server_results) > 1 else line
+                                               for line in backup_summary(sr.stats, self.cfg.backups)]
         except Exception:  # noqa: BLE001
             log.exception("Backup check failed")
+        for sr in server_results.values():
+            try:
+                warning = disk_forecast_warning(self.storage, sr.name, sr.stats, started,
+                                                self.cfg.thresholds.disk_full_warn_days)
+                if warning:
+                    sr.warnings.append(warning)
+            except Exception:  # noqa: BLE001
+                log.exception("Disk trend check failed for %s", sr.name)
         self._check_content(sites, results, diagnoses, save)
 
-        cycle = CycleResult(ts=started, results=results, diagnoses=diagnoses, reach=reach, stats=stats,
-                            vps_warnings=vps_warns, security=security_status)
+        cycle = CycleResult(ts=started, results=results, diagnoses=diagnoses, servers=server_results,
+                            extra_warnings=extra, security=security_status)
         if save:
             self._save(cycle)
         if alert:
@@ -228,29 +278,33 @@ class Monitor:
                     d.status = WARNING
 
     def _error_logs(self, sites: list[SiteConfig], results: list[SiteCheckResult],
-                    reach: VpsReachability | None, stats: VpsStats | None) -> dict[str, list[str]]:
-        """Fetch web server error-log tails, only when a VPS-hosted site is failing."""
-        vps = self.cfg.vps
-        if not vps or not vps.ssh or not stats or not stats.ok or (reach and reach.all_down):
-            return {}
+                    server_results: dict[str, ServerResult]) -> dict[str, list[str]]:
+        """Fetch web server error-log tails from each server that hosts a failing site."""
         by_name = {s.name: s for s in sites}
-        failing = [by_name[r.site] for r in results if r.on_vps and is_failing(r) and r.site in by_name]
-        if not failing:
-            return {}
-        paths = list(vps.ssh.error_logs) + [s.error_log for s in failing if s.error_log]
-        try:
-            logs = fetch_error_logs(vps.host, vps.ssh, paths)
-        except Exception:  # noqa: BLE001
-            log.exception("Fetching error logs failed")
-            return {}
-        stats.error_logs = logs
-        default_lines: list[str] = []
-        for path in vps.ssh.error_logs:
-            if logs.get(path):
-                default_lines += [f"==> {path} <=="] + logs[path]
-        out = {}
-        for s in failing:
-            out[s.name] = logs.get(s.error_log, []) if s.error_log and logs.get(s.error_log) else default_lines
+        failing_by_server: dict[str, list[SiteConfig]] = {}
+        for r in results:
+            site = by_name.get(r.site)
+            if site and site.server and r.on_vps and is_failing(r):
+                failing_by_server.setdefault(site.server, []).append(site)
+        out: dict[str, list[str]] = {}
+        for name, failing in failing_by_server.items():
+            server, sr = self.cfg.servers.get(name), server_results.get(name)
+            if not server or not server.ssh or not sr or not sr.stats or not sr.stats.ok or \
+                    (sr.reach and sr.reach.all_down):
+                continue
+            paths = list(server.ssh.error_logs) + [s.error_log for s in failing if s.error_log]
+            try:
+                logs = fetch_error_logs(server.host, server.ssh, paths)
+            except Exception:  # noqa: BLE001
+                log.exception("Fetching error logs from %s failed", name)
+                continue
+            sr.stats.error_logs = logs
+            default_lines: list[str] = []
+            for path in server.ssh.error_logs:
+                if logs.get(path):
+                    default_lines += [f"==> {path} <=="] + logs[path]
+            for s in failing:
+                out[s.name] = logs.get(s.error_log, []) if s.error_log and logs.get(s.error_log) else default_lines
         return out
 
     def _save(self, cycle: CycleResult) -> None:
@@ -270,15 +324,17 @@ class Monitor:
                 code = d.cause_code or (d.warnings[0].code if d.warnings else None)
                 rows.append((site_id, r.ts, d.status, r.http_status, r.response_ms, code, d.summary, details))
             self.storage.record_checks(rows)  # one transaction for the whole cycle
-            if cycle.reach is not None:
-                st = cycle.stats
-                self.storage.record_vps(
-                    cycle.ts, cycle.reach.reachable, cycle.reach.ports,
-                    st.to_dict() if st and st.ok else None, st.error if st and not st.ok else None)
+            for sr in cycle.servers.values():
+                if sr.reach is None:
+                    continue
+                st = sr.stats
+                self.storage.record_vps(cycle.ts, sr.reach.reachable, sr.reach.ports,
+                                        st.to_dict() if st and st.ok else None, st.error if st and not st.ok else None,
+                                        server=sr.name)
             # Latest server/security warnings for the dashboard and daily report.
-            self.storage.set_kv("server_status", {
-                "ts": cycle.ts, "name": self.server_key, "security": cycle.security,
-                "warnings": [w.__dict__ for w in cycle.vps_warnings]})
+            warnings = [{**w.__dict__, "server": sr.name} for sr in cycle.servers.values() for w in sr.warnings]
+            warnings += [{**w.__dict__, "server": EXTRA_KEY} for w in cycle.extra_warnings]
+            self.storage.set_kv("server_status", {"ts": cycle.ts, "security": cycle.security, "warnings": warnings})
         except Exception as exc:  # noqa: BLE001
             log.exception("Saving check results failed")
             cycle.problems.append(f"saving results failed ({type(exc).__name__}: {exc}) - disk full?")
@@ -296,7 +352,9 @@ class Monitor:
                 if d.status != DOWN:  # a DOWN alert already lists everything that matters
                     events += self.alerts.evaluate_warnings(d.site, d.warnings, cycle.ts)
             if not maintenance.mutes(window, None):
-                events += self.alerts.evaluate_warnings(self.server_key, cycle.vps_warnings, cycle.ts)
+                for sr in cycle.servers.values():
+                    events += self.alerts.evaluate_warnings(sr.name, sr.warnings, cycle.ts)
+                events += self.alerts.evaluate_warnings(EXTRA_KEY, cycle.extra_warnings, cycle.ts)
         except Exception as exc:  # noqa: BLE001
             log.exception("Alert evaluation failed")
             cycle.problems.append(f"alert evaluation failed ({type(exc).__name__}: {exc})")

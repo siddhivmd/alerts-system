@@ -109,6 +109,10 @@ class SiteState:
     # Closed incident whose RECOVERED message has not been delivered yet (retried every cycle):
     recovery_pending: int | None = None             # ... to the normal alert recipients
     recovery_pending_escalation: int | None = None  # ... to the escalation contacts
+    consecutive_successes: int = 0  # good checks in a row while an incident is still open
+    first_success_at: float | None = None  # the incident ends here once recovery is confirmed
+    flapping_since: float | None = None  # site goes up/down repeatedly: individual alerts are muted
+    flap_alerted_at: float | None = None  # the FLAPPING notice was delivered
 
 
 # Columns added after the first release: (table, column, SQL type). Applied on startup.
@@ -118,6 +122,12 @@ MIGRATIONS = [
     ("site_state", "recovery_pending_escalation", "INTEGER"),
     ("incidents", "acknowledged_at", "REAL"),
     ("incidents", "acknowledged_by", "TEXT"),
+    ("vps_stats", "server", "TEXT"),
+    ("site_state", "consecutive_successes", "INTEGER NOT NULL DEFAULT 0"),
+    ("site_state", "first_success_at", "REAL"),
+    ("site_state", "flapping_since", "REAL"),
+    ("site_state", "flap_alerted_at", "REAL"),
+    ("vps_stats", "inode_percent", "REAL"),
 ]
 
 
@@ -265,6 +275,13 @@ class Storage:
         with self._conn() as conn:
             conn.execute("UPDATE incidents SET cause_code=?, cause=? WHERE id=?", (cause_code, cause, incident_id))
 
+    def incident_starts(self, site_id: int, since: float) -> list[float]:
+        """Start times of the site's incidents that began at or after ``since`` (flap detection)."""
+        with self._conn() as conn:
+            rows = conn.execute("SELECT started_at FROM incidents WHERE site_id=? AND started_at >= ? "
+                                "ORDER BY started_at", (site_id, since)).fetchall()
+        return [r["started_at"] for r in rows]
+
     def acknowledge_incident(self, incident_id: int, by: str, ts: float) -> bool:
         """Mark an incident as being handled. Returns False if it does not exist or was already acked."""
         with self._conn() as conn:
@@ -310,9 +327,14 @@ class Storage:
             conn.execute("""
                 INSERT INTO site_state(site_id, consecutive_failures, first_failure_at, incident_id,
                                        last_alert_at, last_alert_cause, escalated_at,
-                                       recovery_pending, recovery_pending_escalation)
-                VALUES (?,?,?,?,?,?,?,?,?)
+                                       recovery_pending, recovery_pending_escalation, consecutive_successes,
+                                       first_success_at, flapping_since, flap_alerted_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(site_id) DO UPDATE SET
+                    consecutive_successes=excluded.consecutive_successes,
+                    first_success_at=excluded.first_success_at,
+                    flapping_since=excluded.flapping_since,
+                    flap_alerted_at=excluded.flap_alerted_at,
                     escalated_at=excluded.escalated_at,
                     consecutive_failures=excluded.consecutive_failures,
                     first_failure_at=excluded.first_failure_at,
@@ -323,7 +345,8 @@ class Storage:
                     recovery_pending_escalation=excluded.recovery_pending_escalation""",
                 (state.site_id, state.consecutive_failures, state.first_failure_at, state.incident_id,
                  state.last_alert_at, state.last_alert_cause, state.escalated_at,
-                 state.recovery_pending, state.recovery_pending_escalation))
+                 state.recovery_pending, state.recovery_pending_escalation, state.consecutive_successes,
+                 state.first_success_at, state.flapping_since, state.flap_alerted_at))
 
     def touch_warning(self, key: str, code: str, ts: float) -> tuple[int, float | None]:
         """Record that a warning is active this cycle. Returns (consecutive sightings, last_sent_at)."""
@@ -348,26 +371,41 @@ class Storage:
 
     # ------------------------------------------------------------------ VPS stats
     def record_vps(self, ts: float, reachable: bool, ports: dict[int, bool], stats: dict[str, Any] | None,
-                   error: str | None) -> None:
+                   error: str | None, server: str | None = None) -> None:
         stats = stats or {}
         with self._conn() as conn:
             conn.execute("""
                 INSERT INTO vps_stats(ts, reachable, ports, ram_percent, cpu_load, cpu_cores, disk_percent,
-                                      oom_kills, services, error) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                                      oom_kills, services, error, server, inode_percent)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (ts, int(reachable), json.dumps({str(k): v for k, v in ports.items()}),
                  stats.get("ram_percent"), stats.get("cpu_load"), stats.get("cpu_cores"),
                  stats.get("disk_percent"), stats.get("oom_kills"),
-                 json.dumps(stats.get("services") or {}), error))
+                 json.dumps(stats.get("services") or {}), error, server, stats.get("inode_percent")))
 
-    def latest_vps(self) -> dict[str, Any] | None:
+    def claim_unnamed_vps_rows(self, server: str) -> None:
+        """Rows written before multi-server support belong to the (then only) first server."""
         with self._conn() as conn:
-            r = conn.execute("SELECT * FROM vps_stats ORDER BY ts DESC LIMIT 1").fetchone()
+            conn.execute("UPDATE vps_stats SET server=? WHERE server IS NULL", (server,))
+
+    def latest_vps(self, server: str | None = None) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            if server is None:
+                r = conn.execute("SELECT * FROM vps_stats ORDER BY ts DESC LIMIT 1").fetchone()
+            else:
+                r = conn.execute("SELECT * FROM vps_stats WHERE server=? ORDER BY ts DESC LIMIT 1",
+                                 (server,)).fetchone()
         return _row(r, json_fields=("ports", "services")) if r else None
 
-    def vps_history(self, since: float) -> list[dict[str, Any]]:
+    def vps_history(self, since: float, server: str | None = None) -> list[dict[str, Any]]:
+        sql = ("SELECT ts, server, reachable, ram_percent, cpu_load, cpu_cores, disk_percent, inode_percent "
+               "FROM vps_stats WHERE ts >= ?")
+        params: list[Any] = [since]
+        if server is not None:
+            sql += " AND server = ?"
+            params.append(server)
         with self._conn() as conn:
-            rows = conn.execute("SELECT ts, reachable, ram_percent, cpu_load, cpu_cores, disk_percent "
-                                "FROM vps_stats WHERE ts >= ? ORDER BY ts", (since,)).fetchall()
+            rows = conn.execute(sql + " ORDER BY ts", params).fetchall()
         return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------ key-value

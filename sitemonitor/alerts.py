@@ -16,6 +16,11 @@ Rules
   with 20 sites produces one email, not twenty.
 * "Last alerted" is only recorded after at least one channel delivered the
   message; if every channel fails, the next cycle retries.
+* Flapping: with ``recovery_successes`` > 1 a site must pass that many checks in
+  a row before RECOVERED (downtime still ends at the first good check). If a site
+  has ``flap_threshold`` outages within ``flap_window_minutes`` it is "flapping":
+  ONE flapping alert replaces the DOWN/RECOVERED storm, then one "stable again"
+  message. If it stays down for a whole window it is treated as a real outage.
 * Escalation (optional): if an incident is still open after ``after_minutes``,
   a separate list of people gets ONE "escalation" alert, and (optionally) a
   recovery message later. It is recorded per incident, so it never repeats.
@@ -49,7 +54,7 @@ RECOVERY_RETRY_HOURS = 24  # after this, an undeliverable RECOVERED message is d
 
 @dataclass
 class AlertEvent:
-    kind: str                     # down | cause_changed | still_down | recovered | warning | escalation
+    kind: str  # down | cause_changed | still_down | recovered | warning | escalation | flapping | stable
     key: str                      # site name, or the VPS name for server warnings
     ts: float
     site_id: int | None = None
@@ -62,6 +67,7 @@ class AlertEvent:
     incident_id: int | None = None  # for recovered: which incident it closes (clears the pending flag)
     notify_normal: bool = True     # for recovered: still owed to the normal alert recipients
     escalated: bool = False        # for recovered: still owed to the escalation contacts
+    count: int | None = None       # for flapping/stable: number of outages in the window
 
 
 # --------------------------------------------------------------------------- decision logic
@@ -80,6 +86,7 @@ class AlertManager:
 
         if diag.status == DOWN:
             state.consecutive_failures += 1
+            state.consecutive_successes, state.first_success_at = 0, None  # a pending recovery is cancelled
             if state.first_failure_at is None:
                 state.first_failure_at = ts
             if state.consecutive_failures >= self.cfg.consecutive_failures:
@@ -90,6 +97,8 @@ class AlertManager:
                     kind = "down"
                     # A RECOVERED message still owed for the previous outage is now wrong: drop it.
                     state.recovery_pending = state.recovery_pending_escalation = None
+                    if state.flapping_since is None and self._is_flapping(site_id, ts):
+                        state.flapping_since, state.flap_alerted_at = ts, None
                 elif state.last_alert_cause is None:
                     kind = "down"  # the first DOWN alert was never delivered: retry
                 elif state.last_alert_cause != diag.cause_code:
@@ -102,27 +111,51 @@ class AlertManager:
                 acked = kind != "down" and self._acknowledged(state.incident_id)
                 if kind == "still_down" and acked:
                     kind = None
+                flapping = state.flapping_since is not None
+                if flapping and ts - state.first_failure_at >= self.cfg.flap_window_minutes * 60:
+                    # Down for a whole flap window: no longer flapping, a real outage. Alert normally.
+                    state.flapping_since = state.flap_alerted_at = None
+                    flapping, kind = False, kind or "still_down"
+                if flapping:
+                    if kind:  # muted: record it as "sent" so it is not retried
+                        state.last_alert_at, state.last_alert_cause = ts, diag.cause_code
+                    kind = None
+                    if state.flap_alerted_at is None:
+                        starts = self.storage.incident_starts(site_id, ts - self.cfg.flap_window_minutes * 60)
+                        events.append(AlertEvent(kind="flapping", key=diag.site, ts=ts, site_id=site_id,
+                                                 url=diag.url, diagnosis=diag, count=len(starts),
+                                                 started_at=starts[0] if starts else ts,
+                                                 duration=self.cfg.flap_window_minutes * 60))
                 if kind:
                     events.append(AlertEvent(kind=kind, key=diag.site, ts=ts, site_id=site_id, url=diag.url,
                                              diagnosis=diag, started_at=state.first_failure_at,
                                              duration=ts - state.first_failure_at))
                 esc = self.cfg.escalation
-                if esc and not acked and state.escalated_at is None \
+                if esc and not acked and not flapping and state.escalated_at is None \
                         and ts - state.first_failure_at >= esc.after_minutes * 60:
                     events.append(AlertEvent(kind="escalation", key=diag.site, ts=ts, site_id=site_id, url=diag.url,
                                              diagnosis=diag, started_at=state.first_failure_at,
                                              duration=ts - state.first_failure_at))
         else:
             if state.incident_id is not None:
-                # Close the incident now (the site IS back), but only mark the RECOVERED message as
-                # owed. mark_sent() clears it once a channel accepts it; until then it is re-sent.
-                self.storage.close_incident(state.incident_id, ts)
-                state.recovery_pending = state.incident_id
-                esc = self.cfg.escalation
-                if esc and esc.notify_recovery and state.escalated_at is not None:
-                    state.recovery_pending_escalation = state.incident_id
+                state.consecutive_successes += 1
+                if state.first_success_at is None:
+                    state.first_success_at = ts
+                if state.consecutive_successes < self.cfg.recovery_successes:
+                    self.storage.save_state(state)  # not confirmed yet: one good check is not a recovery
+                    return events
+                # Close the incident at the FIRST good check (real downtime), but only mark the RECOVERED
+                # message as owed. mark_sent() clears it once a channel accepts it; until then it is re-sent.
+                self.storage.close_incident(state.incident_id, state.first_success_at)
+                if state.flapping_since is None:  # while flapping, the "stable again" message covers it
+                    state.recovery_pending = state.incident_id
+                    esc = self.cfg.escalation
+                    if esc and esc.notify_recovery and state.escalated_at is not None:
+                        state.recovery_pending_escalation = state.incident_id
             events += self._pending_recovery(site_id, diag, state, ts)
+            events += self._flap_ended(site_id, diag, state, ts)
             state.consecutive_failures = 0
+            state.consecutive_successes, state.first_success_at = 0, None
             state.escalated_at = None
             state.first_failure_at = None
             state.incident_id = None
@@ -131,6 +164,26 @@ class AlertManager:
 
         self.storage.save_state(state)
         return events
+
+    def _is_flapping(self, site_id: int, ts: float) -> bool:
+        if not self.cfg.flap_threshold or not self.cfg.flap_window_minutes:
+            return False
+        starts = self.storage.incident_starts(site_id, ts - self.cfg.flap_window_minutes * 60)
+        return len(starts) >= self.cfg.flap_threshold
+
+    def _flap_ended(self, site_id: int, diag: Diagnosis, state: Any, ts: float) -> list[AlertEvent]:
+        """Flapping ends after a full window without a new outage: one "stable again" message."""
+        if state.flapping_since is None:
+            return []
+        window = self.cfg.flap_window_minutes * 60
+        starts = self.storage.incident_starts(site_id, state.flapping_since - window)
+        if starts and ts - starts[-1] < window:
+            return []  # still inside the window: keep waiting
+        since = state.flapping_since
+        state.flapping_since = state.flap_alerted_at = None
+        return [AlertEvent(kind="stable", key=diag.site, ts=ts, site_id=site_id, url=diag.url, diagnosis=diag,
+                           started_at=since, count=len([s for s in starts if s >= since - window]),
+                           duration=ts - since)]
 
     def _acknowledged(self, incident_id: int | None) -> bool:
         if incident_id is None:
@@ -174,6 +227,12 @@ class AlertManager:
         ``escalation=True`` means the events went to the escalation contacts.
         """
         for ev in events:
+            if ev.kind == "flapping" and ev.site_id is not None and not escalation:
+                state = self.storage.get_state(ev.site_id)
+                if state.flapping_since is not None:
+                    state.flap_alerted_at = ev.ts
+                    self.storage.save_state(state)
+                continue
             if ev.kind == "recovered" and ev.site_id is not None:
                 state = self.storage.get_state(ev.site_id)
                 if escalation and state.recovery_pending_escalation == ev.incident_id:
@@ -232,18 +291,24 @@ class Formatter:
             longest = max(e.duration or 0 for e in esc)
             return f"[ESCALATION] Still down after {format_duration(longest)}: {', '.join(e.key for e in esc)}"
         down = [e.key for e in events if e.kind in DOWN_KINDS]
+        flap = [e.key for e in events if e.kind == "flapping"]
+        stable = [e.key for e in events if e.kind == "stable"]
         rec = [e.key for e in events if e.kind == "recovered"]
         warn = sorted({e.key for e in events if e.kind == "warning"})
         parts = []
+        if flap:
+            parts.append(f"FLAPPING: {', '.join(flap)}")
         if down:
             parts.append(f"DOWN: {', '.join(down)}")
         if rec:
             parts.append(f"RECOVERED: {', '.join(rec)}")
+        if stable:
+            parts.append(f"STABLE again: {', '.join(stable)}")
         if warn and not parts:
             parts.append(f"Warning: {', '.join(warn)}")
         elif warn:
             parts.append(f"+{sum(1 for e in events if e.kind == 'warning')} warning(s)")
-        prefix = "[ALERT]" if down else "[OK]" if rec and not warn else "[WARN]"
+        prefix = "[ALERT]" if down or flap else "[OK]" if (rec or stable) and not warn else "[WARN]"
         return f"{prefix} " + " | ".join(parts)
 
     def event(self, ev: AlertEvent, full: bool = True) -> str:
@@ -272,6 +337,18 @@ class Formatter:
             if d.fixes:
                 lines.append("Suggested fix:")
                 lines += [f"  - {f}" for f in (d.fixes if full else d.fixes[:2])]
+        elif ev.kind == "flapping" and d is not None:
+            lines.append(f"🔁 FLAPPING: {ev.key} went down {ev.count} times in the last "
+                         f"{format_duration(ev.duration)}  {ev.url}")
+            lines.append(f"Latest cause: {d.cause}")
+            lines.append("Individual DOWN/RECOVERED alerts are paused for this site until it is stable; "
+                         "if it stays down, you will be alerted normally.")
+            if d.fixes:
+                lines.append("Suggested fix:")
+                lines += [f"  - {f}" for f in (d.fixes if full else d.fixes[:2])]
+        elif ev.kind == "stable":
+            lines.append(f"✅ STABLE again: {ev.key} - no new outage for {format_duration(ev.duration)} "
+                         f"({ev.count} outage(s) while flapping, since {self.when(ev.started_at)})  {ev.url}")
         elif ev.kind == "recovered":
             lines.append(f"✅ RECOVERED: {ev.key}  {ev.url}")
             lines.append(f"Downtime: {format_duration(ev.duration)} "
@@ -289,7 +366,8 @@ class Formatter:
         return "\n".join(lines)
 
     def body(self, events: list[AlertEvent], full: bool = True) -> str:
-        order = {"escalation": 0, "down": 0, "cause_changed": 0, "still_down": 1, "recovered": 2, "warning": 3}
+        order = {"escalation": 0, "flapping": 0, "down": 0, "cause_changed": 0, "still_down": 1, "recovered": 2,
+                 "stable": 2, "warning": 3}
         events = sorted(events, key=lambda e: (order.get(e.kind, 9), e.key))
         header = f"Site monitor report - {self.when(time.time())}"
         return header + "\n\n" + "\n\n".join(self.event(e, full) for e in events)

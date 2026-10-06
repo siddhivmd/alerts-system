@@ -26,6 +26,9 @@ thresholds:
   ram_percent: 90                # RAM above this is reported as a cause when a site is down
   disk_percent: 95               # disk above this = "storage full" (critical)
   disk_warn_percent: 85          # early warning for disk
+  disk_full_warn_days: 7         # trend: warn when disk growth would fill it within N days (0 = off)
+  inode_percent: 95              # inodes (file slots) used: "No space left on device" with free space
+  inode_warn_percent: 85
   cpu_load_per_core: 2.0         # 1-min load average divided by cores
   ssl_warn_days: 14              # first SSL expiry warning
   ssl_critical_days: 3           # second, critical SSL expiry warning
@@ -39,6 +42,11 @@ defaults:
   check_ssl: true
   check_domain: true             # WHOIS lookup (cached 24h)
 
+# One server: this `vps:` block. Several servers: use a `servers:` list instead (not both):
+#   servers:
+#     - {name: web1, host: 1.2.3.4, ssh: {user: monitor, key_file: ~/.ssh/monitor_ed25519}}
+#     - {name: web2, host: 5.6.7.8, ssh: {user: monitor, key_file: ~/.ssh/monitor_ed25519}}
+# and give each site `server: web1` (sites without it use the first server).
 vps:
   enabled: false                 # set true once host is your real VPS IP
   name: Hostinger VPS
@@ -65,6 +73,9 @@ alerts:
   throttle_minutes: 30           # repeat a still-down alert at most this often
   warning_repeat_hours: 24       # repeat warnings (SSL/domain expiry, slow, disk) at most this often
   console: true                  # also print alert messages to the log - useful while testing
+  recovery_successes: 2          # good checks in a row before RECOVERED (stops up/down/up storms)
+  flap_threshold: 3              # this many outages within flap_window_minutes = "flapping":
+  flap_window_minutes: 60        #   one FLAPPING alert instead of many DOWN/RECOVERED (0 = off)
   email:
     enabled: false               # needs host, to, and SMTP_PASSWORD in .env
     host: smtp.gmail.com
@@ -159,6 +170,16 @@ sites:
     timeout: 20
     slow_threshold_ms: 5000
     error_log: /var/log/nginx/portal.error.log   # per-site log (optional)
+    expected_ip: [1.2.3.4]       # DNS must point here (IPs or ranges); anything else = possible DNS hijack
+    login:                       # optional: log in with a TEST account to prove the app really works
+      url: https://portal.example.com/login        # page with the form (default: the site url)
+      fields:                    # the form's field names; "env:NAME" = value from .env (keep secrets there)
+        email: monitor@example.com
+        password: env:PORTAL_TEST_PASS
+      csrf_field: _token         # hidden token field to copy from the form (Laravel: _token, Django: csrfmiddlewaretoken)
+      expect_keyword: "Log out"  # text shown only when logged in
+      failure_keywords: ["These credentials do not match"]
+      after_url: https://portal.example.com/account  # optional: a page that needs the session
 
   - name: API health
     url: https://api.example.com/health

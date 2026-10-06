@@ -201,7 +201,7 @@ def make_config(**security):
     return Config(general=GeneralConfig(), thresholds=Thresholds(), alerts=AlertsConfig(),
                   daily_report=DailyReportConfig(), dashboard=DashboardConfig(),
                   sites=[SiteConfig(name="Shop", url="https://shop.test/")],
-                  vps=VpsConfig(host="1.2.3.4"), security=SecurityConfig(**security))
+                  servers={"VPS": VpsConfig(host="1.2.3.4")}, security=SecurityConfig(**security))
 
 
 def test_checker_caches_blacklist_between_intervals():
@@ -210,7 +210,8 @@ def test_checker_caches_blacklist_between_intervals():
     checker.refresh(now=1000.0)
     checker.refresh(now=1000.0 + 30 * 60)       # within the hour: cached
     assert len(resolve.calls) == 1
-    assert [w.code for w in checker.server_warnings(None)] == ["blacklisted:1.2.3.4:zen.spamhaus.org"]
+    codes = {k: [w.code for w in v] for k, v in checker.server_warnings(None).items()}
+    assert codes == {"VPS": ["blacklisted:1.2.3.4:zen.spamhaus.org"]}
     checker.refresh(now=1000.0 + 61 * 60)       # interval elapsed: looked up again
     assert len(resolve.calls) == 2
 
@@ -224,7 +225,8 @@ def test_checker_extra_ips_and_safe_browsing_site_warnings():
     checker = SecurityChecker(cfg, resolve, post)
     checker.refresh(now=1.0)
     assert [r.ip for r in checker.blacklist_results] == ["1.2.3.4", "127.0.0.2"]
-    assert [w.code for w in checker.server_warnings(None)] == ["blacklisted:127.0.0.2:zen.spamhaus.org"]
+    codes = {k: [w.code for w in v] for k, v in checker.server_warnings(None).items()}
+    assert codes == {"Server": ["blacklisted:127.0.0.2:zen.spamhaus.org"]}  # extra IP: not a configured server
     [w] = checker.site_warnings()["Shop"]
     assert w.code == "safe_browsing" and "malware" in w.message
     assert checker.summary()["safe_browsing"] == "1 site(s) flagged"
@@ -249,4 +251,5 @@ def test_checker_does_nothing_when_disabled():
     resolve = fake_resolver({})
     checker = SecurityChecker(make_config(enabled=False), resolve)
     checker.refresh(now=1.0)
-    assert resolve.calls == [] and checker.server_warnings(healthy_stats(outbound_smtp=99)) == []
+    assert resolve.calls == []
+    assert all(not w for w in checker.server_warnings({"VPS": healthy_stats(outbound_smtp=99)}).values())

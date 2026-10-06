@@ -5,8 +5,10 @@ object instead of raising: one broken site must never abort a check cycle.
 """
 from __future__ import annotations
 
+import html as html_lib
 import ipaddress
 import logging
+import re
 import socket
 import ssl
 import threading
@@ -50,6 +52,8 @@ class SiteCheckResult:
     dns_ok: bool | None = None
     dns_error: str | None = None
     ip_addresses: list[str] = field(default_factory=list)
+    expected_ip: list[str] = field(default_factory=list)
+    unexpected_ips: list[str] = field(default_factory=list)  # resolved IPs outside expected_ip (hijack?)
 
     http_status: int | None = None
     status_ok: bool | None = None
@@ -64,6 +68,9 @@ class SiteCheckResult:
     keyword: str | None = None
     keyword_found: bool | None = None
     forbidden_found: list[str] = field(default_factory=list)
+    login_ok: bool | None = None  # None = no login check configured / not run
+    login_error: str | None = None
+    login_ms: int | None = None
     page_words: list[str] | None = None  # for defacement detection (not stored in history)
     defacement_text: str | None = None
 
@@ -121,6 +128,21 @@ def resolve_dns(host: str) -> tuple[list[str], str | None]:
         return [], f"{exc.strerror or exc}"
     except (OSError, UnicodeError) as exc:
         return [], str(exc)
+
+
+def unexpected_ips(resolved: list[str], expected: list[str]) -> list[str]:
+    """Resolved addresses that are in none of the expected IPs/ranges."""
+    nets = [ipaddress.ip_network(e, strict=False) for e in expected]
+    out = []
+    for ip in resolved:
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            out.append(ip)
+            continue
+        if not any(addr.version == n.version and addr in n for n in nets):
+            out.append(ip)
+    return out
 
 
 # --------------------------------------------------------------------------- SSL
@@ -213,12 +235,33 @@ def _to_datetime(value: Any) -> datetime | None:
     return None
 
 
-class WhoisLookup:
-    """WHOIS expiry lookups cached in SQLite (registrars rate-limit aggressively)."""
+RDAP_URL = "https://rdap.org/domain/{domain}"  # bootstrap service: redirects to the registry's RDAP server
 
-    def __init__(self, storage: Any | None = None, timeout: int = 10) -> None:
+
+def _rdap_expiry(payload: dict[str, Any]) -> datetime | None:
+    for event in payload.get("events") or []:
+        if str(event.get("eventAction", "")).lower() in ("expiration", "registration expiration"):
+            text = str(event.get("eventDate", "")).replace("Z", "+00:00")
+            try:
+                dt = datetime.fromisoformat(text)
+            except ValueError:
+                return _to_datetime(event.get("eventDate"))
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    return None
+
+
+class WhoisLookup:
+    """Domain expiry lookups: RDAP first (structured JSON), python-whois as fallback.
+
+    Cached in SQLite, because registries rate-limit aggressively.
+    """
+
+    def __init__(self, storage: Any | None = None, timeout: int = 10,
+                 http_get: Callable[..., Any] | None = None, whois_query: Callable[[str], Any] | None = None) -> None:
         self.storage = storage
         self.timeout = timeout
+        self._http_get = http_get or requests.get
+        self._whois_query = whois_query
         self._locks: dict[str, threading.Lock] = {}
         self._guard = threading.Lock()
 
@@ -244,9 +287,37 @@ class WhoisLookup:
             return expires, error
 
     def _query(self, domain: str) -> tuple[datetime | None, str | None]:
+        expires, rdap_error = self._rdap(domain)
+        if expires is not None:
+            return expires, None
+        expires, whois_error = self._whois(domain)
+        if expires is not None:
+            return expires, None
+        # Neither source had a date. Keep WHOIS's wording: "No match" there means "not registered".
+        return None, f"{whois_error} (RDAP: {rdap_error})" if rdap_error else whois_error
+
+    def _rdap(self, domain: str) -> tuple[datetime | None, str | None]:
+        """RDAP lookup. A 'not found' is NOT trusted alone: rdap.org also says so for TLDs without RDAP."""
         try:
-            import whois  # python-whois
-            data = whois.whois(domain, quiet=True, timeout=self.timeout)
+            resp = self._http_get(RDAP_URL.format(domain=domain), timeout=self.timeout,
+                                  headers={"Accept": "application/rdap+json, application/json"})
+            if resp.status_code == 404:
+                return None, "no RDAP record"
+            if resp.status_code >= 400:
+                return None, f"HTTP {resp.status_code}"
+            expires = _rdap_expiry(resp.json() or {})
+            return (expires, None) if expires else (None, "no expiry date in RDAP record")
+        except Exception as exc:  # noqa: BLE001
+            log.info("RDAP lookup failed for %s: %s", domain, exc)
+            return None, f"lookup failed: {type(exc).__name__}"
+
+    def _whois(self, domain: str) -> tuple[datetime | None, str | None]:
+        try:
+            if self._whois_query is not None:
+                data = self._whois_query(domain)
+            else:
+                import whois  # python-whois
+                data = whois.whois(domain, quiet=True, timeout=self.timeout)
             expires = _to_datetime(data.get("expiration_date") if hasattr(data, "get") else None)
             if expires is None:
                 return None, "WHOIS returned no expiry date (some TLDs hide it)"
@@ -254,6 +325,71 @@ class WhoisLookup:
         except Exception as exc:  # noqa: BLE001 - library raises many types
             log.info("WHOIS lookup failed for %s: %s", domain, exc)
             return None, f"WHOIS lookup failed: {str(exc).splitlines()[0][:200] if str(exc) else type(exc).__name__}"
+
+
+# --------------------------------------------------------------------------- login check
+
+_INPUT_RE = re.compile(r"<input\b[^>]*>", re.I)
+_META_RE = re.compile(r"<meta\b[^>]*>", re.I)
+
+
+def _attr(tag: str, name: str) -> str | None:
+    m = re.search(rf"""\b{name}\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""", tag, re.I)
+    return None if not m else next(g for g in m.groups() if g is not None)
+
+
+def extract_token(page: str, field_name: str) -> str | None:
+    """Value of <input name=FIELD value=...> or <meta name=FIELD content=...> (CSRF tokens)."""
+    for tag in _INPUT_RE.findall(page):
+        if _attr(tag, "name") == field_name:
+            return html_lib.unescape(_attr(tag, "value") or "")
+    for tag in _META_RE.findall(page):
+        if _attr(tag, "name") == field_name:
+            return html_lib.unescape(_attr(tag, "content") or "")
+    return None
+
+
+def login_check(site: SiteConfig, user_agent: str, session_factory: Callable[[], Any] = requests.Session
+                ) -> tuple[bool, str | None, int]:
+    """Log in with the test account. Returns (ok, error, ms). Error texts never contain field values."""
+    lc = site.login
+    assert lc is not None
+    form_url = lc.url or site.url
+    headers = {"User-Agent": user_agent, **site.headers}
+    start = time.perf_counter()
+    elapsed = lambda: int((time.perf_counter() - start) * 1000)  # noqa: E731
+    session = session_factory()
+    try:
+        form = session.get(form_url, headers=headers, timeout=lc.timeout, verify=site.verify_ssl)
+        if form.status_code >= 400:
+            return False, f"login page returned HTTP {form.status_code}", elapsed()
+        data = dict(lc.fields)
+        if lc.csrf_field:
+            token = extract_token(form.text, lc.csrf_field)
+            if not token:
+                return False, f"login page has no '{lc.csrf_field}' token (form changed?)", elapsed()
+            data[lc.csrf_field] = token
+        resp = session.post(lc.post_url or form_url, data=data, headers={**headers, "Referer": form_url},
+                            timeout=lc.timeout, verify=site.verify_ssl, allow_redirects=True)
+        if resp.status_code >= 400:
+            return False, f"submitting the login form returned HTTP {resp.status_code}", elapsed()
+        page = resp.text
+        if lc.after_url:
+            after = session.get(lc.after_url, headers=headers, timeout=lc.timeout, verify=site.verify_ssl)
+            if after.status_code >= 400:
+                return False, f"page after login returned HTTP {after.status_code} (session lost?)", elapsed()
+            page = after.text
+        rejected = next((k for k in lc.failure_keywords if k in page), None)
+        if rejected:
+            return False, f"login rejected: the page says '{rejected}'", elapsed()
+        if lc.expect_keyword not in page:
+            return False, (f"after logging in, '{lc.expect_keyword}' is not on the page "
+                           "(login rejected, or a session/database problem)"), elapsed()
+        return True, None, elapsed()
+    except requests.exceptions.RequestException as exc:
+        return False, f"login request failed: {type(exc).__name__}", elapsed()
+    finally:
+        session.close()
 
 
 # --------------------------------------------------------------------------- HTTP
@@ -322,6 +458,9 @@ def check_site(site: SiteConfig, whois_lookup: WhoisLookup | None = None,
         host = site.hostname
         result.ip_addresses, result.dns_error = resolve_dns(host)
         result.dns_ok = result.dns_error is None
+        if result.dns_ok and site.expected_ip:
+            result.expected_ip = list(site.expected_ip)
+            result.unexpected_ips = unexpected_ips(result.ip_addresses, site.expected_ip)
 
         # Domain expiry is still useful when DNS fails: it tells us *why* DNS fails.
         if site.check_domain and whois_lookup is not None:
@@ -346,6 +485,9 @@ def check_site(site: SiteConfig, whois_lookup: WhoisLookup | None = None,
             result.ssl_error = info["error"]
 
         _http_check(site, result, user_agent)
+        page_ok = result.status_ok and result.keyword_found is not False and not result.forbidden_found
+        if site.login is not None and page_ok:  # only worth trying when the page itself works
+            result.login_ok, result.login_error, result.login_ms = login_check(site, user_agent)
     except Exception as exc:  # noqa: BLE001 - last line of defence
         log.exception("Unexpected error while checking %s", site.name)
         result.error_kind = result.error_kind or "internal"

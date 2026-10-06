@@ -12,6 +12,7 @@ monitor. Real mistakes - unknown keys, invalid values - still raise ConfigError.
 """
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 from dataclasses import dataclass, field
@@ -25,6 +26,20 @@ from dotenv import load_dotenv
 
 class ConfigError(ValueError):
     """Raised when the configuration is missing or invalid."""
+
+
+@dataclass
+class LoginConfig:
+    """Optional transaction check: log in with a TEST account and verify the logged-in page."""
+
+    expect_keyword: str  # must appear after logging in, e.g. "Dashboard" or "Log out"
+    fields: dict[str, str] = field(default_factory=dict)  # form fields; "env:NAME" values come from .env
+    url: str | None = None  # page with the login form (default: the site url)
+    post_url: str | None = None  # where the form is submitted (default: url)
+    csrf_field: str | None = None  # hidden input / meta tag to copy from the form, e.g. _token
+    after_url: str | None = None  # optional page to open after login, to prove the session works
+    failure_keywords: list[str] = field(default_factory=list)  # e.g. "Invalid password"
+    timeout: float = 20.0
 
 
 @dataclass
@@ -50,6 +65,9 @@ class SiteConfig:
     public_name: str | None = None  # name shown on the public status page (default: name)
     content_change_alert: float = 70.0  # % of page words that must change suddenly -> defacement warning; 0 = off
     client: str | None = None  # id of the client (under clients:) this site belongs to
+    server: str | None = None  # name of the server (under servers:) hosting it; default: the first server
+    expected_ip: list[str] = field(default_factory=list)  # DNS must resolve only to these IPs/ranges (hijack check)
+    login: LoginConfig | None = None  # optional login/transaction check with a test account
 
     @property
     def hostname(self) -> str:
@@ -65,6 +83,9 @@ class Thresholds:
     ram_percent: float = 90.0
     disk_percent: float = 95.0
     disk_warn_percent: float = 85.0
+    disk_full_warn_days: float = 7.0  # warn when the disk trend says "full within N days"; 0 = off
+    inode_percent: float = 95.0  # inodes used: "No space left on device" with free space
+    inode_warn_percent: float = 85.0
     cpu_load_per_core: float = 2.0
     ssl_warn_days: int = 14
     ssl_critical_days: int = 3
@@ -152,6 +173,9 @@ class AlertsConfig:
     throttle_minutes: int = 30
     warning_repeat_hours: int = 24
     console: bool = False  # also write alert messages to the log/console (handy for testing)
+    recovery_successes: int = 1  # good checks in a row before RECOVERED (2 stops up/down/up message storms)
+    flap_threshold: int = 3  # this many outages within flap_window_minutes = "flapping": one alert, not a storm
+    flap_window_minutes: int = 60  # 0 or flap_threshold 0 disables flap detection
     email: EmailConfig | None = None
     telegram: TelegramConfig | None = None
     whatsapp: WhatsAppConfig | None = None
@@ -288,7 +312,7 @@ class Config:
     daily_report: DailyReportConfig
     dashboard: DashboardConfig
     sites: list[SiteConfig]
-    vps: VpsConfig | None = None
+    servers: dict[str, VpsConfig] = field(default_factory=dict)  # name -> server (ordered)
     security: SecurityConfig = field(default_factory=SecurityConfig)
     heartbeat: HeartbeatConfig = field(default_factory=HeartbeatConfig)
     monthly_report: MonthlyReportConfig = field(default_factory=MonthlyReportConfig)
@@ -297,6 +321,14 @@ class Config:
     clients: dict[str, ClientConfig] = field(default_factory=dict)
     base_dir: Path = Path(".")
     warnings: list[str] = field(default_factory=list)  # features switched off because of missing settings
+
+    @property
+    def vps(self) -> VpsConfig | None:
+        """The first server (most setups have exactly one)."""
+        return next(iter(self.servers.values()), None)
+
+    def server_for(self, site: SiteConfig) -> VpsConfig | None:
+        return self.servers.get(site.server) if site.server else None
 
 
 # --------------------------------------------------------------------------- helpers
@@ -363,11 +395,59 @@ def _build_site(raw: dict[str, Any], defaults: dict[str, Any], index: int) -> Si
     if "expected_status" in data and data["expected_status"] is not None:
         data["expected_status"] = [int(s) for s in _as_list(data["expected_status"])]
     data["forbidden_keywords"] = [str(k) for k in _as_list(data.get("forbidden_keywords"))]
+    data["expected_ip"] = [str(v).strip() for v in _as_list(data.get("expected_ip")) if str(v).strip()]
+    if data.get("login"):
+        lraw = dict(data["login"])
+        if not lraw.get("expect_keyword"):
+            raise ConfigError(f"{where}: login.expect_keyword is required (text shown only when logged in)")
+        lraw["fields"] = {str(k): str(v) for k, v in (lraw.get("fields") or {}).items()}
+        lraw["failure_keywords"] = [str(k) for k in _as_list(lraw.get("failure_keywords"))]
+        for key in ("url", "post_url", "after_url"):
+            if lraw.get(key) and not str(lraw[key]).startswith(("http://", "https://")):
+                raise ConfigError(f"{where}: login.{key} must be a full http(s):// URL")
+        data["login"] = LoginConfig(**_pick(lraw, LoginConfig, f"{where}.login"))
+    else:
+        data["login"] = None
+    for value in data["expected_ip"]:
+        try:
+            ipaddress.ip_network(value, strict=False)
+        except ValueError:
+            raise ConfigError(f"{where}: expected_ip {value!r} is not an IP address or range (e.g. 1.2.3.4 or "
+                              "104.16.0.0/13)") from None
     data["headers"] = {str(k): str(v) for k, v in (data.get("headers") or {}).items()}
     site = SiteConfig(**data)
     if site.timeout <= 0:
         raise ConfigError(f"{where}: timeout must be > 0")
     return site
+
+
+def _build_server(raw: dict[str, Any], where: str, base: Path, general: GeneralConfig,
+                  warnings: list[str]) -> VpsConfig | None:
+    """One monitored server. Returns None if it is disabled or has no host."""
+    if not raw.pop("enabled", True):
+        return None
+    if not raw.get("host"):
+        if raw:
+            warnings.append(f"Server checks off for {where}: host is not set")
+        return None
+    ssh_raw = raw.pop("ssh", None)
+    server = VpsConfig(**_pick(raw, VpsConfig, where))
+    server.name = str(server.name)
+    server.ports = [int(p) for p in server.ports]
+    if ssh_raw and ssh_raw.get("enabled", True) and not (ssh_raw.get("user") and ssh_raw.get("key_file")):
+        warnings.append(f"SSH stats off for {server.name}: ssh needs both 'user' and 'key_file'")
+    elif ssh_raw and ssh_raw.get("enabled", True):
+        ssh_raw = {k: v for k, v in ssh_raw.items() if k != "enabled"}
+        ssh = SshConfig(**_pick(ssh_raw, SshConfig, f"{where}.ssh"))
+        ssh.key_file = _resolve(base, ssh.key_file)
+        ssh.known_hosts = _resolve(base, ssh.known_hosts) if ssh.known_hosts else str(
+            Path(general.database).parent / "known_hosts")
+        ssh.key_passphrase = _env("SSH_KEY_PASSPHRASE")
+        if Path(ssh.key_file).exists():
+            server.ssh = ssh
+        else:
+            warnings.append(f"SSH stats off for {server.name}: key file not found: {ssh.key_file}")
+    return server
 
 
 def load_config(path: str | os.PathLike[str] = "config.yaml", env_file: str | None = None) -> Config:
@@ -404,31 +484,27 @@ def load_config(path: str | os.PathLike[str] = "config.yaml", env_file: str | No
 
     thresholds = Thresholds(**_pick(_section(raw, "thresholds"), Thresholds, "thresholds"))
 
-    # --- VPS
+    # --- servers: either one `vps:` block (classic) or a `servers:` list
     warnings: list[str] = []
-    vps: VpsConfig | None = None
-    vps_raw = _section(raw, "vps")
-    vps_enabled = vps_raw.pop("enabled", True)
-    if vps_enabled and not vps_raw.get("host"):
-        if vps_raw:
-            warnings.append("VPS checks off: vps.host is not set")
-    elif vps_enabled:
-        ssh_raw = vps_raw.pop("ssh", None)
-        vps = VpsConfig(**_pick(vps_raw, VpsConfig, "vps"))
-        vps.ports = [int(p) for p in vps.ports]
-        if ssh_raw and ssh_raw.get("enabled", True) and not (ssh_raw.get("user") and ssh_raw.get("key_file")):
-            warnings.append("SSH stats off: vps.ssh needs both 'user' and 'key_file'")
-        elif ssh_raw and ssh_raw.get("enabled", True):
-            ssh_raw = {k: v for k, v in ssh_raw.items() if k != "enabled"}
-            ssh = SshConfig(**_pick(ssh_raw, SshConfig, "vps.ssh"))
-            ssh.key_file = _resolve(base, ssh.key_file)
-            ssh.known_hosts = _resolve(base, ssh.known_hosts) if ssh.known_hosts else str(
-                Path(general.database).parent / "known_hosts")
-            ssh.key_passphrase = _env("SSH_KEY_PASSPHRASE")
-            if Path(ssh.key_file).exists():
-                vps.ssh = ssh
-            else:
-                warnings.append(f"SSH stats off: key file not found: {ssh.key_file}")
+    if raw.get("vps") and raw.get("servers"):
+        raise ConfigError("Use either 'vps:' (one server) or 'servers:' (a list), not both")
+    servers: dict[str, VpsConfig] = {}
+    if raw.get("servers") is not None:
+        if not isinstance(raw["servers"], list):
+            raise ConfigError("'servers' must be a list, e.g. servers: [{name: web1, host: 1.2.3.4}]")
+        for i, sraw in enumerate(raw["servers"]):
+            if not isinstance(sraw, dict) or not sraw.get("name"):
+                raise ConfigError(f"servers[{i}] needs a name")
+            if str(sraw["name"]) in servers:
+                raise ConfigError(f"Duplicate server name: {sraw['name']}")
+            server = _build_server(dict(sraw), f"servers[{i}] ({sraw['name']})", base, general, warnings)
+            if server:
+                servers[server.name] = server
+    else:
+        server = _build_server(dict(_section(raw, "vps")), "vps", base, general, warnings)
+        if server:
+            servers[server.name] = server
+    vps = next(iter(servers.values()), None)
 
     # --- alerts
     alerts_raw = _section(raw, "alerts")
@@ -439,6 +515,10 @@ def load_config(path: str | os.PathLike[str] = "config.yaml", env_file: str | No
     alerts = AlertsConfig(**_pick(alerts_raw, AlertsConfig, "alerts"))
     if alerts.consecutive_failures < 1:
         raise ConfigError("alerts.consecutive_failures must be >= 1")
+    if alerts.recovery_successes < 1:
+        raise ConfigError("alerts.recovery_successes must be >= 1")
+    if alerts.flap_threshold and alerts.flap_threshold < 2:
+        raise ConfigError("alerts.flap_threshold must be >= 2 (or 0 to disable)")
 
     if email_raw.get("enabled", False):
         email_raw = {k: v for k, v in email_raw.items() if k != "enabled"}
@@ -546,6 +626,35 @@ def load_config(path: str | os.PathLike[str] = "config.yaml", env_file: str | No
     if dupes:
         raise ConfigError(f"Duplicate site names: {', '.join(sorted(dupes))}")
 
+    # --- login checks: resolve "env:NAME" secrets; missing secret -> that check is off (with a warning)
+    for site in sites:
+        if site.login is None:
+            continue
+        missing = []
+        for key, value in list(site.login.fields.items()):
+            if value.startswith("env:"):
+                secret = _env(value[4:])
+                if secret is None:
+                    missing.append(value[4:])
+                else:
+                    site.login.fields[key] = secret
+        if missing:
+            warnings.append(f"Login check off for {site.name}: missing {', '.join(missing)} in .env")
+            site.login = None
+
+    # --- which server hosts each site
+    for site in sites:
+        if site.server is not None:
+            site.server = str(site.server)
+            if site.server not in servers:
+                raise ConfigError(f"Site {site.name!r}: unknown server {site.server!r} "
+                                  f"(defined: {', '.join(servers) or 'none'})")
+            site.on_vps = True
+        elif site.on_vps and vps is not None:
+            site.server = vps.name  # default: the first (often only) server
+        if site.server is None:
+            site.on_vps = False  # no monitored server -> no server-based diagnosis
+
     # --- clients (optional grouping for SLA reports and status pages)
     clients_raw = raw.get("clients") or {}
     if not isinstance(clients_raw, dict):
@@ -613,11 +722,11 @@ def load_config(path: str | os.PathLike[str] = "config.yaml", env_file: str | No
     if backups.enabled and not backups.paths:
         warnings.append("Backup check off: add at least one pattern under backups.paths")
         backups.enabled = False
-    if backups.enabled and not (vps and vps.ssh):
+    if backups.enabled and not any(sv.ssh for sv in servers.values()):
         warnings.append("Backup check off: it needs vps.ssh")
         backups.enabled = False
 
     return Config(general=general, thresholds=thresholds, alerts=alerts, daily_report=daily,
-                  dashboard=dashboard, sites=sites, vps=vps, security=security, heartbeat=heartbeat,
+                  dashboard=dashboard, sites=sites, servers=servers, security=security, heartbeat=heartbeat,
                   monthly_report=monthly, status_page=status_page, backups=backups, clients=clients,
                   base_dir=base, warnings=warnings)

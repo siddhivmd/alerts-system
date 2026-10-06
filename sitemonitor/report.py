@@ -57,22 +57,23 @@ def build_daily_report(cfg: Config, storage: Storage, now: float | None = None) 
                          f"({format_duration((end or now) - start)})")
         lines.append("")
 
-    if cfg.vps:
-        v = storage.latest_vps()
+    for server in cfg.servers.values():
+        v = storage.latest_vps(server.name)
         if v:
-            lines.append(f"VPS {cfg.vps.name} ({cfg.vps.host}) at {fmt.when(v['ts'])}: "
+            lines.append(f"Server {server.name} ({server.host}) at {fmt.when(v['ts'])}: "
                          f"{'reachable' if v['reachable'] else 'UNREACHABLE'}")
             if v["ram_percent"] is not None:
                 load = f"{v['cpu_load']:.2f} on {v['cpu_cores']} cores" if v["cpu_load"] is not None else "n/a"
-                lines.append(f"  RAM {v['ram_percent']:.0f}% | CPU load {load} | Disk {v['disk_percent'] or 0:.0f}% | "
-                             f"OOM kills: {v['oom_kills']}")
+                inodes = f" | Inodes {v['inode_percent']:.0f}%" if v.get("inode_percent") is not None else ""
+                lines.append(f"  RAM {v['ram_percent']:.0f}% | CPU load {load} | Disk {v['disk_percent'] or 0:.0f}%"
+                             f"{inodes} | OOM kills: {v['oom_kills']}")
                 services = v.get("services") or {}
                 states = [f"{name}={st.get('active')}" for name, st in services.items()]
                 lines.append(f"  Services: {', '.join(states) or 'n/a'}")
             elif v["error"]:
                 lines.append(f"  Stats unavailable: {v['error']}")
         else:
-            lines.append("VPS: no data yet")
+            lines.append(f"Server {server.name}: no data yet")
         lines.append("")
 
     # Server health + security (blacklists, Safe Browsing, miners, new PHP files, ...).
@@ -87,7 +88,7 @@ def build_daily_report(cfg: Config, storage: Storage, now: float | None = None) 
         lines.append("")
     for w in server.get("warnings", []):
         label = "CRITICAL" if w.get("severity") == "critical" else "warning"
-        warnings.append(f"{server.get('name', 'Server')} ({label}): {w.get('message')}")
+        warnings.append(f"{w.get('server') or server.get('name', 'Server')} ({label}): {w.get('message')}")
 
     lines.append("Needs attention:" if warnings else "Needs attention: nothing")
     lines += [f"  - {w}" for w in warnings]

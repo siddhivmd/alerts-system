@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import fnmatch
 import ipaddress
+from collections import defaultdict
 import logging
 import socket
 import time
@@ -59,6 +60,7 @@ MINER_SIGNATURES = (
 )
 TEMP_DIRS = ("/tmp/", "/var/tmp/", "/dev/shm/")
 MAX_PROCESS_WARNINGS = 5
+EXTRA_KEY = "Server"  # alert key for security.extra_ips that do not belong to a configured server
 MAX_FILE_WARNINGS = 10
 
 
@@ -297,22 +299,32 @@ class SecurityChecker:
         self._blacklist_at: float | None = None  # None = never run yet
         self.blacklist_results: list[BlacklistResult] = []
         self._sb_at: float | None = None
+        self.ip_owner: dict[str, str] = {}  # blacklisted IP -> server name
         self.safe_browsing_flags: dict[str, list[str]] = {}
         self.safe_browsing_error: str | None = None
 
     def _blacklist_ips(self) -> list[str]:
+        """Every server's IP (hostnames resolved) plus security.extra_ips; remembers who owns which."""
         ips: list[str] = []
-        if self.cfg.vps:
-            host = self.cfg.vps.host
+        self.ip_owner = {}
+        for server in self.cfg.servers.values():
+            host = server.host
             try:
                 ipaddress.ip_address(host)
-                ips.append(host)
+                ip = host
             except ValueError:
                 try:
-                    ips.append(self._resolve(host))
+                    ip = self._resolve(host)
                 except OSError as exc:
-                    log.warning("Blacklist check: could not resolve VPS host %s: %s", host, exc)
-        ips += [ip for ip in self.sec.extra_ips if ip not in ips]
+                    log.warning("Blacklist check: could not resolve server %s (%s): %s", server.name, host, exc)
+                    continue
+            if ip not in ips:
+                ips.append(ip)
+                self.ip_owner[ip] = server.name
+        for ip in self.sec.extra_ips:
+            if ip not in ips:
+                ips.append(ip)
+                self.ip_owner[ip] = EXTRA_KEY
         return ips
 
     @staticmethod
@@ -345,11 +357,14 @@ class SecurityChecker:
             else:
                 self.safe_browsing_flags = flags
 
-    def server_warnings(self, stats: VpsStats | None) -> list[Warn]:
-        out: list[Warn] = []
+    def server_warnings(self, stats_by_server: dict[str, VpsStats | None] | None) -> dict[str, list[Warn]]:
+        """Security warnings per server name (EXTRA_KEY for extra_ips)."""
+        out: dict[str, list[Warn]] = defaultdict(list)
         for r in self.blacklist_results:
-            out += blacklist_warnings(r)
-        return out + server_security_warnings(stats, self.sec)
+            out[self.ip_owner.get(r.ip, EXTRA_KEY)] += blacklist_warnings(r)
+        for name, stats in (stats_by_server or {}).items():
+            out[name] += server_security_warnings(stats, self.sec)
+        return {name: warns for name, warns in out.items() if warns}
 
     def site_warnings(self) -> dict[str, list[Warn]]:
         by_url = {s.url: s.name for s in self.cfg.sites}
@@ -366,5 +381,5 @@ class SecurityChecker:
             "enabled": self.sec.enabled,
             "blacklists": [r.summary() for r in self.blacklist_results],
             "safe_browsing": sb,
-            "ssh_checks": bool(self.cfg.vps and self.cfg.vps.ssh and self.sec.enabled),
+            "ssh_checks": bool(self.sec.enabled and any(s.ssh for s in self.cfg.servers.values())),
         }

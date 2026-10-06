@@ -52,17 +52,19 @@ def print_cycle(cycle: CycleResult, cfg: Config) -> None:
     paint = {"up": "\033[32m", "warning": "\033[33m", "down": "\033[31m"} if color else {}
     reset = "\033[0m" if color else ""
 
-    if cycle.reach is not None:
-        ports = ", ".join(f"{p}:{'open' if ok else 'CLOSED'}" for p, ok in cycle.reach.ports.items())
-        print(f"VPS {cfg.vps.name} ({cycle.reach.host}): {'reachable' if cycle.reach.reachable else 'UNREACHABLE'} [{ports}]")
-        st = cycle.stats
+    for sr in cycle.servers.values():
+        if sr.reach is None:
+            continue
+        ports = ", ".join(f"{p}:{'open' if ok else 'CLOSED'}" for p, ok in sr.reach.ports.items())
+        print(f"Server {sr.name} ({sr.host}): {'reachable' if sr.reach.reachable else 'UNREACHABLE'} [{ports}]")
+        st = sr.stats
         if st is None:
             print("  SSH stats: not configured")
         elif not st.ok:
             print(f"  SSH stats unavailable: {st.error}")
         else:
             print(f"  RAM {st.ram_percent}% | load {st.cpu_load} on {st.cpu_cores} cores | disk / {st.disk_percent}% "
-                  f"| OOM kills ({st.oom_window}): {st.oom_kills}")
+                  f"| inodes {st.inode_percent}% | OOM kills ({st.oom_window}): {st.oom_kills}")
             services = ", ".join(f"{name}={s.get('active')}" for name, s in st.services.items())
             print(f"  services: {services or 'none found'}")
         print()
@@ -278,9 +280,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     signal.signal(signal.SIGTERM, _terminate)
     signal.signal(signal.SIGINT, _terminate)
 
-    log.info("Starting monitor: %d site(s), every %d min, VPS=%s, SSH=%s, email=%s, telegram=%s",
-             len(cfg.sites), cfg.general.check_interval_minutes, cfg.vps.host if cfg.vps else "none",
-             bool(cfg.vps and cfg.vps.ssh), bool(cfg.alerts.email), bool(cfg.alerts.telegram))
+    log.info("Starting monitor: %d site(s), every %d min, servers=%s, email=%s, telegram=%s",
+             len(cfg.sites), cfg.general.check_interval_minutes,
+             ", ".join(f"{s.name}({'ssh' if s.ssh else 'no ssh'})" for s in cfg.servers.values()) or "none",
+             bool(cfg.alerts.email), bool(cfg.alerts.telegram))
     if not cfg.alerts.email and not cfg.alerts.telegram:
         log.warning("No email/Telegram alerts enabled - problems will only show in the log%s and dashboard",
                     " (console alerts on)" if cfg.alerts.console else "")

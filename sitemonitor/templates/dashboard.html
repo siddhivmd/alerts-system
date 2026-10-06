@@ -124,11 +124,7 @@ select { font: inherit; color: var(--text); background: var(--surface); border: 
 
   <div class="banner" id="banner" role="alert"></div>
 
-  <section class="card" id="vps-card" aria-labelledby="vps-title">
-    <h2 id="vps-title">VPS</h2>
-    <div class="tiles" id="vps-tiles"></div>
-    <div class="services" id="vps-services"></div>
-  </section>
+  <div id="servers"></div>
 
   <section class="card" id="security-card" aria-labelledby="security-title">
     <h2 id="security-title">Security &amp; server warnings</h2>
@@ -258,13 +254,17 @@ select { font: inherit; color: var(--text); background: var(--surface); border: 
     return tile;
   }
 
-  function renderVps(v) {
-    const card = document.getElementById("vps-card");
-    if (!v) { card.style.display = "none"; return; }
-    card.style.display = "";
-    document.getElementById("vps-title").textContent = `VPS ${v.name} (${v.host})`;
-    const tiles = document.getElementById("vps-tiles");
-    tiles.replaceChildren();
+  function renderServers(list) {
+    const box = document.getElementById("servers");
+    box.replaceChildren(...(list || []).map(renderServer));
+  }
+
+  function renderServer(v) {
+    const card = el("section", { class: "card", "aria-label": `Server ${v.name}` });
+    card.append(el("h2", { text: `Server ${v.name} (${v.host})` }));
+    if (v.sites && v.sites.length) card.append(el("div", { class: "meta", style: "margin:-6px 0 10px", text: `Hosts: ${v.sites.join(", ")}` }));
+    const tiles = el("div", { class: "tiles" });
+    card.append(tiles);
     const reach = el("div", { class: "tile" }, el("div", { class: "label", text: "Reachability" }));
     reach.append(el("div", { class: "value" }, statusBadge(v.ts ? (v.reachable ? "up" : "down") : null)));
     const ports = Object.entries(v.ports || {}).map(([p, ok]) => `${p} ${ok ? "open" : "closed"}`).join(" · ");
@@ -278,16 +278,19 @@ select { font: inherit; color: var(--text); background: var(--surface); border: 
       tiles.append(meterTile("CPU load (1 min)", v.cpu_load !== null ? v.cpu_load.toFixed(2) : null, "",
         perCore !== null ? perCore / t.load_per_core * 100 : null, 75, 100, `${v.cpu_cores || "?"} cores · alert at ${t.load_per_core}/core`));
       tiles.append(meterTile("OOM kills (24h)", v.oom_kills, "", null, 0, 0, v.oom_kills ? "processes killed for memory" : "none"));
+      if (v.inode_percent !== null && v.inode_percent !== undefined)
+        tiles.append(meterTile("Inodes used (/)", Math.round(v.inode_percent), "%", v.inode_percent, t.inode_warn, t.inode, "files/folders; full = 'No space left'"));
     } else {
       tiles.append(el("div", { class: "tile" }, el("div", { class: "label", text: "Server stats" }),
         el("div", { class: "sub", text: v.ssh_configured ? (v.error || "no data yet") : "SSH not configured: only external checks run" })));
     }
-    const svc = document.getElementById("vps-services");
-    svc.replaceChildren();
+    const svc = el("div", { class: "services" });
     for (const [name, s] of Object.entries(v.services || {})) {
       const bad = s.active === "failed" || (s.active === "inactive" && s.enabled === "enabled");
       svc.append(el("span", { class: "chip" + (bad ? " bad" : ""), text: `${name}: ${s.active}` }));
     }
+    card.append(svc);
+    return card;
   }
 
   // ---------- sites table + sparklines
@@ -533,7 +536,7 @@ select { font: inherit; color: var(--text); background: var(--surface); border: 
       banner.textContent = down.length ? `${down.length} site(s) down: ${down.map(s => s.name).join(", ")}` : "";
       document.title = down.length ? `(${down.length} down) Site Monitor` : "Site Monitor";
     }
-    renderVps(st.vps);
+    renderServers(st.servers || (st.vps ? [st.vps] : []));
     renderSecurity(st.security);
     renderSelect(st.sites);
     renderSites(st.sites, state.history);

@@ -83,17 +83,21 @@ def build_status(cfg: Config, storage: Storage) -> dict[str, Any]:
     sites.sort(key=lambda x: (_STATUS_ORDER.get(x["status"], 3), x["name"].lower()))
 
     counts = {k: sum(1 for x in sites if x["status"] == k) for k in ("up", "warning", "down")}
-    vps = None
-    if cfg.vps:
-        v = storage.latest_vps() or {}
-        vps = {"name": cfg.vps.name, "host": cfg.vps.host, "ts": v.get("ts"), "reachable": bool(v.get("reachable")),
-               "ports": v.get("ports") or {}, "ram_percent": v.get("ram_percent"), "cpu_load": v.get("cpu_load"),
-               "cpu_cores": v.get("cpu_cores"), "disk_percent": v.get("disk_percent"),
-               "oom_kills": v.get("oom_kills"), "services": v.get("services") or {}, "error": v.get("error"),
-               "ssh_configured": cfg.vps.ssh is not None,
-               "thresholds": {"ram": cfg.thresholds.ram_percent, "disk": cfg.thresholds.disk_percent,
-                              "disk_warn": cfg.thresholds.disk_warn_percent,
-                              "load_per_core": cfg.thresholds.cpu_load_per_core}}
+    servers = []
+    for server in cfg.servers.values():
+        v = storage.latest_vps(server.name) or {}
+        servers.append({
+            "name": server.name, "host": server.host, "ts": v.get("ts"), "reachable": bool(v.get("reachable")),
+            "ports": v.get("ports") or {}, "ram_percent": v.get("ram_percent"), "cpu_load": v.get("cpu_load"),
+            "cpu_cores": v.get("cpu_cores"), "disk_percent": v.get("disk_percent"),
+            "inode_percent": v.get("inode_percent"), "oom_kills": v.get("oom_kills"),
+            "services": v.get("services") or {}, "error": v.get("error"), "ssh_configured": server.ssh is not None,
+            "sites": [s.name for s in cfg.sites if s.server == server.name],
+            "thresholds": {"ram": cfg.thresholds.ram_percent, "disk": cfg.thresholds.disk_percent,
+                           "disk_warn": cfg.thresholds.disk_warn_percent,
+                           "inode": cfg.thresholds.inode_percent, "inode_warn": cfg.thresholds.inode_warn_percent,
+                           "load_per_core": cfg.thresholds.cpu_load_per_core}})
+    vps = servers[0] if servers else None  # kept for single-server API users
     conn = storage.get_kv("connectivity") or {}
     recent = [p for p in conn.get("periods") or [] if p["until"] >= now - 86400]
     monitor_state = {"offline": bool(conn.get("offline")), "offline_since": conn.get("since"),
@@ -103,7 +107,7 @@ def build_status(cfg: Config, storage: Storage) -> dict[str, Any]:
                 "warnings": server.get("warnings", []), **(server.get("security") or {})}
     return {"generated_at": now, "check_interval_minutes": cfg.general.check_interval_minutes,
             "timezone": cfg.general.timezone, "counts": {**counts, "total": len(sites)},
-            "sites": sites, "vps": vps, "security": security, "monitor": monitor_state}
+            "sites": sites, "vps": vps, "servers": servers, "security": security, "monitor": monitor_state}
 
 
 def create_app(cfg: Config, storage: Storage, last_cycle: Callable[[], float | None] | None = None,

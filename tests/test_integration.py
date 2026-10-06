@@ -92,7 +92,7 @@ def test_enabled_features_missing_secrets_are_switched_off_not_fatal(tmp_path, m
     assert cfg.vps is not None and cfg.vps.ssh is None
     assert cfg.alerts.email is None and cfg.alerts.telegram is None
     joined = " | ".join(cfg.warnings)
-    assert "SSH stats off: key file not found" in joined
+    assert "SSH stats off for VPS: key file not found" in joined
     assert "Email alerts off: missing SMTP_PASSWORD" in joined
     assert "Telegram alerts off: missing TELEGRAM_BOT_TOKEN" in joined
 

@@ -41,6 +41,8 @@ class VpsStats:
     uptime_seconds: float | None = None
     disk_percent: float | None = None  # root filesystem
     disks: dict[str, float] = field(default_factory=dict)  # mount -> used %
+    inode_percent: float | None = None  # root filesystem: % of inodes (file slots) used
+    inodes: dict[str, float] = field(default_factory=dict)  # mount -> inodes used %
     oom_kills: int | None = None
     oom_window: str = "24h"
     oom_last: str | None = None
@@ -137,6 +139,7 @@ echo '##MEM'; grep -E '^(MemTotal|MemAvailable|SwapTotal|SwapFree):' /proc/memin
 echo '##LOAD'; cat /proc/loadavg; nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo
 echo '##UPTIME'; cat /proc/uptime
 echo '##DISK'; df -P -x tmpfs -x devtmpfs -x overlay -x squashfs 2>/dev/null
+echo '##INODES'; df -iP -x tmpfs -x devtmpfs -x overlay -x squashfs 2>/dev/null
 echo '##OOM'
 if command -v journalctl >/dev/null 2>&1; then
   echo 'window=24h'; {sudo}journalctl -k --since '24 hours ago' --no-pager -q 2>/dev/null | grep -i 'killed process' | tail -n 100
@@ -203,6 +206,16 @@ def parse_stats(output: str, service_patterns: list[str]) -> VpsStats:
             except ValueError:
                 continue
     st.disk_percent = st.disks.get("/")
+
+    # df -iP: Filesystem Inodes IUsed IFree IUse% Mounted. Some filesystems (btrfs, zfs) report "-".
+    for line in s.get("INODES", [])[1:]:
+        parts = line.split()
+        if len(parts) >= 6 and parts[4].endswith("%"):
+            try:
+                st.inodes[parts[5]] = float(parts[4].rstrip("%"))
+            except ValueError:
+                continue
+    st.inode_percent = st.inodes.get("/")
 
     oom_lines = s.get("OOM", [])
     if oom_lines and oom_lines[0].startswith("window="):

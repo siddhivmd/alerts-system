@@ -107,7 +107,7 @@ def compute(cfg: Config, storage: Storage, start: float, end: float, now: float 
         client = cfg.clients.get(site.client or "")
         st = SiteStats(name=site.name, public_name=site.public_name or site.name, url=site.url,
                        client=site.client or NO_CLIENT,
-                       server=(cfg.vps.name if cfg.vps else "VPS") if site.on_vps else "External hosting",
+                       server=site.server or "External hosting",
                        sla_target=client.sla_target if client else 99.9)
         s = summary.get(ids.get(site.name), {})
         st.checks, st.uptime_pct, st.avg_ms = s.get("total", 0), s.get("uptime_pct"), s.get("avg_ms")

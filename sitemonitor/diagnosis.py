@@ -94,8 +94,8 @@ def _service_rank(name: str) -> int:
 # Known error-log / page signatures -> (code, explanation, fix)
 _LOG_PATTERNS: list[tuple[re.Pattern[str], str, str, str]] = [
     (re.compile(r"No space left on device", re.I), "log_disk_full",
-     "Error log shows 'No space left on device' (disk full)",
-     "Free disk space: sudo du -xh / --max-depth=2 | sort -rh | head -20"),
+     "Error log shows 'No space left on device' (disk full, or out of inodes)",
+     "Check both: df -h (space) and df -i (inodes); then sudo du -xh / --max-depth=2 | sort -rh | head -20"),
     (re.compile(r"php[\d.]*-fpm\.sock.*(failed|No such file|Connection refused)|connect\(\) to unix:.*fpm", re.I),
      "log_php_fpm", "Web server cannot reach PHP-FPM (php-fpm socket down)",
      "Restart PHP-FPM: sudo systemctl restart php*-fpm  (check the exact unit: systemctl list-units '*fpm*')"),
@@ -137,6 +137,14 @@ def vps_findings(stats: VpsStats | None, reach: VpsReachability | None, t: Thres
             out.append(Finding("disk_full", f"Disk is {stats.disk_percent:.0f}% full (threshold {t.disk_percent:.0f}%)", [
                 "Find what is using space: sudo du -xh / --max-depth=2 | sort -rh | head -20",
                 "Quick wins: sudo journalctl --vacuum-size=200M; sudo apt clean; remove old backups/logs in /var/log",
+            ]))
+        if stats.inode_percent is not None and stats.inode_percent >= t.inode_percent:
+            out.append(Finding("inodes_full", f"Disk is out of inodes ({stats.inode_percent:.0f}% of file slots used): "
+                               "'No space left on device' even though there is free space", [
+                "Find folders with the most files: sudo find / -xdev -type f 2>/dev/null | cut -d/ -f2-4 | "
+                "sort | uniq -c | sort -rn | head -15",
+                "Usual suspects: PHP sessions (/var/lib/php/sessions), cache folders, mail queue; delete old files "
+                "e.g. sudo find /var/lib/php/sessions -type f -mtime +2 -delete",
             ]))
         for name in sorted(stats.failed_services, key=lambda n: (_service_rank(n), n)):
             state = stats.services[name]
@@ -217,6 +225,12 @@ def vps_warnings(stats: VpsStats | None, reach: VpsReachability | None, t: Thres
         crit = stats.disk_percent >= t.disk_percent
         out.append(Warn("disk_critical" if crit else "disk_high", f"Disk {stats.disk_percent:.0f}% full",
                         "critical" if crit else "warning", "sudo du -xh / --max-depth=2 | sort -rh | head -20"))
+    if stats.inode_percent is not None and stats.inode_percent >= t.inode_warn_percent:
+        crit = stats.inode_percent >= t.inode_percent
+        out.append(Warn("inodes_critical" if crit else "inodes_high",
+                        f"Inodes {stats.inode_percent:.0f}% used (too many small files, e.g. PHP sessions/cache)",
+                        "critical" if crit else "warning",
+                        "sudo find / -xdev -type f 2>/dev/null | cut -d/ -f2-4 | sort | uniq -c | sort -rn | head"))
     if stats.ram_percent is not None and stats.ram_percent >= t.ram_percent:
         out.append(Warn("ram_high", f"RAM usage {stats.ram_percent:.0f}%", fix="ps aux --sort=-%mem | head -15"))
     if stats.load_per_core is not None and stats.load_per_core >= t.cpu_load_per_core:
@@ -333,6 +347,17 @@ def diagnose(r: SiteCheckResult, reach: VpsReachability | None, stats: VpsStats 
             "Check the domain has not expired (registrar panel / whois)",
             f"Check nameservers and the A record in your DNS panel; `nslookup {host}` must return your server's IP"])
 
+    # 1b) DNS answers, but with someone else's server: hijacked nameservers/records, or an unplanned move
+    if r.unexpected_ips:
+        d.evidence.append(f"Resolved: {', '.join(r.ip_addresses)}; expected: {', '.join(r.expected_ip)}")
+        return down("dns_unexpected_ip",
+                    f"DNS points to {', '.join(r.unexpected_ips)}, not your server ({', '.join(r.expected_ip)}): "
+                    "nameservers or A record changed - possible DNS hijack", [
+                        "Check the domain's nameservers and A/AAAA records at your registrar and DNS host NOW",
+                        "If they were changed without you: change the registrar password, enable 2FA and "
+                        "registrar lock, then restore the records",
+                        "If you moved the site on purpose: update expected_ip in config.yaml"])
+
     # 2) VPS unreachable on every port -> down or suspended
     failing = is_failing(r)
     if failing and uses_vps and reach.all_down:
@@ -366,7 +391,7 @@ def diagnose(r: SiteCheckResult, reach: VpsReachability | None, stats: VpsStats 
     log_findings = _scan_text(error_log)
 
     hard_failure = r.error_kind in ("timeout", "connection", "request") or (
-        r.http_status is not None and r.http_status >= 500) or bool(r.forbidden_found)
+        r.http_status is not None and r.http_status >= 500) or bool(r.forbidden_found) or r.login_ok is False
 
     # 4) VPS up but the site is failing: look for the server-side root cause
     server = vps_findings(stats, reach, t) if uses_vps else []
@@ -414,13 +439,22 @@ def diagnose(r: SiteCheckResult, reach: VpsReachability | None, stats: VpsStats 
                         "Open the page in a browser and compare with the normal content",
                         "If content looks injected/unknown, treat as a compromise: scan for malware now",
                         "If the template changed on purpose, update the keyword in config.yaml"])
+    if r.login_ok is False:
+        return down("login_failed", f"Page loads but logging in fails: {r.login_error}", [
+            "Log in by hand with the test account to confirm",
+            "Check the database (is MySQL/MariaDB running? 'Too many connections'?) and the PHP error log",
+            "Check that PHP sessions can be written: disk space AND inodes (df -h; df -i), session folder "
+            "permissions",
+            "If the login form changed (new field names or token), update the site's login: settings"])
     return down("unknown", "Site failed for an unknown reason", ["Open the site in a browser and check the logs"])
 
 
 def is_failing(r: SiteCheckResult) -> bool:
     """True if the raw result shows the site is not working (before any interpretation)."""
     return bool(
-        r.error_kind
+        r.login_ok is False
+        or r.unexpected_ips
+        or r.error_kind
         or r.status_ok is False
         or (r.keyword and r.keyword_found is False)
         or r.forbidden_found

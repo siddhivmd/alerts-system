@@ -160,9 +160,29 @@ Notes:
 - **Deploying code triggers the new-PHP-file warning.** That's expected. Add folders you change often to `php_watch_ignore`.
 - **Permissions:** the `monitor` user needs the `systemd-journal` group (already in the SSH setup below) to read SSH logins. It needs read access to the web folders to find new PHP files.
 
+## More checks
+
+| Check | How to enable | What it catches |
+|---|---|---|
+| **DNS hijack** | `expected_ip: [1.2.3.4]` on a site. IPs or ranges both work; for a site behind Cloudflare, list Cloudflare's ranges | DNS resolving **anywhere else** (changed nameservers or A record). The site is DOWN with the cause "DNS points to X, not your server", even if a page loads |
+| **Login / transaction** | A `login:` block on a site (see `config.example.yaml`) | "The page loads but logging in is broken": a dead database, sessions that can't be written, a broken deploy. The monitor fetches the form, copies the CSRF token, posts a **test account**, and checks the logged-in page shows `expect_keyword`. Put the password in `.env` and refer to it as `env:NAME`; it never appears in logs or alerts |
+| **Inodes** | Automatic over SSH (`df -i`) | "No space left on device" while `df -h` shows free space. That means too many small files, typically PHP sessions or cache. It's the diagnosed cause when a site fails, with a warning from 85% |
+| **Disk trend** | Automatic over SSH (`thresholds.disk_full_warn_days`, default 7) | A straight-line fit over 7 days of disk history, e.g. "Disk 72% full and growing ~3%/day: full in about 9d". Needs at least 24h of history |
+| **Domain expiry: RDAP first** | Automatic | RDAP (structured JSON from the registry) is tried first; the old WHOIS lookup is the fallback. More reliable, including for many ccTLDs |
+
+### Several servers
+
+Replace the `vps:` block with a `servers:` list and give each site `server: <name>`; sites without one use the first server. Each server is checked separately: its ports, SSH stats, error logs, blacklists, backups and disk trend. Each site is diagnosed with **its own** server's data, so web1's crashed nginx is never blamed for a site on web2. The dashboard and reports show one block per server. Existing `vps:` setups keep working unchanged.
+
 ## How alerts are sent
 
 - **2 failures in a row** before a DOWN alert. This filters out one-off network blips.
+- **Confirmed recovery (optional):** with `recovery_successes: 2`, a site must pass 2 checks in a row before RECOVERED is sent. The downtime still ends at the first good check.
+- **Flapping:** if a site has `flap_threshold` (default 3) outages within `flap_window_minutes` (default 60), it's "flapping".
+  - You get **one** FLAPPING alert instead of a DOWN/RECOVERED storm.
+  - You get one "STABLE again" message once a full window passes without a new outage.
+  - Every outage is still recorded for the reports.
+  - If the site then stays down for a whole window, it's treated as a real outage and you're alerted normally.
 - **The monitor's own internet is checked first.** Each cycle starts with a quick "canary" test: it connects to well-known hosts (`1.1.1.1`, `8.8.8.8`, `www.google.com`, `cloudflare.com`; set in `general.canary_hosts`). If none of them answer, the problem is the monitoring machine, not your sites. That cycle is skipped:
   - no sites are checked
   - no incidents are opened
