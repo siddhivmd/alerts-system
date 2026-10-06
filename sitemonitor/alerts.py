@@ -97,12 +97,18 @@ class AlertManager:
                     kind = "cause_changed"
                 elif ts - (state.last_alert_at or 0) >= self.cfg.throttle_minutes * 60:
                     kind = "still_down"
+                # Someone acknowledged the incident ("I'm on it"): stop the reminders and the
+                # escalation. A *new* cause and the final RECOVERED message are still sent.
+                acked = kind != "down" and self._acknowledged(state.incident_id)
+                if kind == "still_down" and acked:
+                    kind = None
                 if kind:
                     events.append(AlertEvent(kind=kind, key=diag.site, ts=ts, site_id=site_id, url=diag.url,
                                              diagnosis=diag, started_at=state.first_failure_at,
                                              duration=ts - state.first_failure_at))
                 esc = self.cfg.escalation
-                if esc and state.escalated_at is None and ts - state.first_failure_at >= esc.after_minutes * 60:
+                if esc and not acked and state.escalated_at is None \
+                        and ts - state.first_failure_at >= esc.after_minutes * 60:
                     events.append(AlertEvent(kind="escalation", key=diag.site, ts=ts, site_id=site_id, url=diag.url,
                                              diagnosis=diag, started_at=state.first_failure_at,
                                              duration=ts - state.first_failure_at))
@@ -125,6 +131,12 @@ class AlertManager:
 
         self.storage.save_state(state)
         return events
+
+    def _acknowledged(self, incident_id: int | None) -> bool:
+        if incident_id is None:
+            return False
+        incident = self.storage.get_incident(incident_id)
+        return bool(incident and incident.get("acknowledged_at"))
 
     def _pending_recovery(self, site_id: int, diag: Diagnosis, state: Any, ts: float) -> list[AlertEvent]:
         """RECOVERED message for a closed incident that has not been delivered yet (first try or retry)."""
@@ -298,11 +310,17 @@ class EmailChannel:
         self.cfg = cfg
 
     def send(self, subject: str, text: str) -> None:
+        self.send_rich(subject, text)
+
+    def send_rich(self, subject: str, text: str, html: str | None = None, to: list[str] | None = None) -> None:
+        """Plain-text email, optionally with an HTML version and other recipients (monthly reports)."""
         msg = EmailMessage()
         msg["Subject"] = subject
         msg["From"] = self.cfg.from_addr
-        msg["To"] = ", ".join(self.cfg.to)
+        msg["To"] = ", ".join(to or self.cfg.to)
         msg.set_content(text)
+        if html:
+            msg.add_alternative(html, subtype="html")
         ctx = ssl.create_default_context()
         if self.cfg.security == "ssl":
             server: smtplib.SMTP = smtplib.SMTP_SSL(self.cfg.host, self.cfg.port, timeout=self.cfg.timeout, context=ctx)

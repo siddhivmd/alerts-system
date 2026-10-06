@@ -78,6 +78,63 @@ Only real cycles ping: scheduled ones, or `check --alert`. A plain `monitor.py c
 
 Using both is fine: the heartbeat catches everything, including a dead network, while `/healthz` also confirms the web server is up.
 
+## For your clients: SLA reports and status pages
+
+Group sites by customer with a `clients:` section and `client:` on each site (see `config.example.yaml`).
+
+### Monthly SLA report per client
+
+On the 1st of each month (`monthly_report`), each client gets a report for the previous month. For every site it shows:
+- **uptime %** against the promised `sla_target`, e.g. "99.97% ✓ target 99.9% met"
+- each incident: when it started, how long it took to fix, and the cause
+- average response time
+- SSL certificate and domain expiry
+
+You also receive an **internal reliability report** with the numbers below.
+
+- **Review before clients see anything.** By default (`send_to_clients: false`) every report is emailed to **you**, marked `[PREVIEW for <client>]`. Once you trust the reports, set `send_to_clients: true` and fill in each client's `report_to`.
+- **PDF:** each report is also saved as HTML in `data/reports/YYYY-MM/<client>.html`. Open it in a browser and choose **Print → Save as PDF**.
+- **Any month on demand:** `python monitor.py report --month 2026-09 [--client acme] [--send]`. Without `--send` it only prints the reports and saves the HTML files.
+- **How uptime is measured:** it's the share of checks that weren't DOWN. Time when the monitor itself was offline has no checks, so it never counts against a client.
+- **Limitation:** planned maintenance (`pause`) still counts as downtime in the uptime %.
+
+### Public status page per client
+
+Set `status_page.enabled: true` and `status_page: true` on a client. Then:
+- **`/status/<client>`** shows "All systems operational" or "Outage", each site's `public_name`, a 30-day uptime bar (one block per day) and recent disruptions. It refreshes every minute. The page **never shows URLs, causes or server details**.
+- **`/status/<client>.json`** is the same data as JSON, which the client can embed on their own site.
+- **A custom address** such as `status.clientname.com`:
+  1. Set the client's `status_domain`.
+  2. Point that DNS name (an A or CNAME record) at the monitoring server.
+  3. Let your reverse proxy pass it through. For example, with Caddy:
+     ```
+     status.clientname.com {
+         reverse_proxy 127.0.0.1:8080
+     }
+     ```
+     Caddy gets the HTTPS certificate automatically.
+- **Needs a public server.** The status page has to be reachable from the internet, so it only works on the permanent server, behind a reverse proxy with `DASHBOARD_PASSWORD` set. The dashboard keeps its login; only `/status...` and `/healthz` are public.
+
+### Reliability metrics (for you)
+
+The dashboard's **Reliability, last 30 days** section, the internal monthly report and `/api/reliability?days=30` show, per site and per server:
+- incidents and total downtime
+- **MTTA** (mean time to acknowledge) and **MTTR** (mean time to recover)
+- incidents nobody acknowledged
+- **top causes**, e.g. "Service php8.2-fpm is failed ×8"
+
+That tells you where to spend engineering time, or when to upgrade a VPS plan.
+
+**Acknowledging** means "I'm on it". It records who responded and how fast, which is what MTTA measures. It also **stops the STILL DOWN reminders and the escalation** for that incident; a changed cause and the final RECOVERED message are still sent. You can acknowledge from the dashboard (the **Acknowledge** button on an open incident) or with `python monitor.py ack "Site name" --by YourName`.
+
+### Other commands
+
+| Command | What it does |
+|---|---|
+| `python monitor.py pause 2h [--site NAME] [--reason ...]` | Maintenance mode: mutes alerts for that long. Checks keep running. Use `resume` to end it early |
+| `python monitor.py resume` | Ends maintenance mode |
+| `python monitor.py accept-content [--site NAME]` | Accepts an intended page redesign, so it isn't flagged as possible defacement |
+
 ## Security early warning
 
 Hosts suspend accounts for "malicious activity", meaning the server was sending spam, attacking other servers, or hosting malware. This almost always happens after a site gets hacked. These checks try to spot it before the host does. All of them are optional, and all of them only **read**; nothing on the server is changed.

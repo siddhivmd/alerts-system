@@ -117,10 +117,38 @@ dashboard:
   username: admin                # password: DASHBOARD_PASSWORD in .env.
                                  # Without it the dashboard still runs, with no login, on 127.0.0.1 only.
 
+# Monthly SLA report per client (+ an internal reliability report for you), on `day` at `time`.
+monthly_report:
+  enabled: true
+  day: 1                         # sends LAST month's report
+  time: "09:00"
+  channels: [email]
+  send_to_clients: false         # false = every report comes to YOU (alerts.email.to) as a preview first
+  save_html: true                # also saved in reports_dir; open in a browser and Print > Save as PDF
+  reports_dir: data/reports
+
+# Public, read-only status pages: /status/<client id> (and /status for all sites).
+# Shows public names, up/down and uptime bars only - never URLs, causes or server details.
+status_page:
+  enabled: false
+  days: 30                       # history bars
+  show_incidents: true
+
+# Your hosting customers. Sites below refer to them with `client:`.
+clients:
+  acme:                          # id: lowercase letters, digits, - (used in the status page URL)
+    name: Acme Ltd
+    report_to: [it@acme.example] # receives the monthly report once send_to_clients is true
+    sla_target: 99.9             # promised monthly uptime %
+    status_page: true            # publish /status/acme
+    status_domain: status.acme.example   # optional: point this DNS name at the monitor (see README)
+
 sites:
   - name: Main Website
     url: https://example.com
     keyword: "Example Domain"    # must appear in the page (case-sensitive)
+    client: acme
+    public_name: Acme website    # name shown on the status page and in client reports
 
   - name: Client Portal
     url: https://portal.example.com/login

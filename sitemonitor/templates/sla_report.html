@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ title }} - {{ period }}</title>
+<style>
+  /* Email-safe: simple selectors, also inlined where it matters. Prints cleanly to PDF. */
+  body { margin: 0; background: #f9f9f7; color: #0b0b0b; font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Arial, sans-serif; }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 24px 16px; }
+  .card { background: #ffffff; border: 1px solid #e1e0d9; border-radius: 10px; padding: 20px; margin-bottom: 16px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 16px; margin: 0 0 10px; }
+  .muted { color: #52514e; font-size: 13px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: #52514e; font-weight: 600; padding: 6px 8px; border-bottom: 1px solid #c3c2b7; }
+  td { padding: 7px 8px; border-bottom: 1px solid #ecebe6; vertical-align: top; }
+  .num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .ok { color: #006300; font-weight: 600; } .bad { color: #b12c2c; font-weight: 600; } .warn { color: #8a5a00; font-weight: 600; }
+  .big { font-size: 28px; font-weight: 700; }
+  @media print { body { background: #fff; } .card { border: 0; padding: 0 0 12px; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1>{{ title }}</h1>
+    <div class="muted">{{ period }} &middot; generated {{ generated }}</div>
+  </div>
+
+  {% for s in stats %}
+  <div class="card">
+    <h2>{{ s.public_name }}{% if internal and client is none and s.client in clients %} <span class="muted">({{ clients[s.client].name }})</span>{% endif %}</h2>
+    <div class="muted" style="margin-bottom:12px">{{ s.url }}</div>
+    <table role="presentation">
+      <tr>
+        <td style="border:0;padding-left:0">
+          <div class="muted">Uptime</div>
+          <div class="big">{{ s.uptime_pct | pct }}</div>
+          {% if s.sla_met is true %}<div class="ok">&#10003; Target {{ s.sla_target }}% met</div>
+          {% elif s.sla_met is false %}<div class="bad">&#10007; Below target {{ s.sla_target }}%</div>
+          {% else %}<div class="muted">No checks recorded this period</div>{% endif %}
+        </td>
+        <td style="border:0">
+          <div class="muted">Incidents</div><div class="big">{{ s.incidents | length }}</div>
+          <div class="muted">downtime {{ s.downtime_s | duration }}</div>
+        </td>
+        <td style="border:0">
+          <div class="muted">Avg response</div>
+          <div class="big">{% if s.avg_ms is none %}-{% else %}{{ s.avg_ms }}<span style="font-size:14px"> ms</span>{% endif %}</div>
+        </td>
+      </tr>
+    </table>
+    <p class="muted" style="margin:10px 0 0">
+      SSL certificate: <span class="{{ 'bad' if s.ssl_days_left is not none and s.ssl_days_left < 14 else '' }}">{{ days(s.ssl_days_left) }}</span>
+      &middot; Domain: <span class="{{ 'bad' if s.domain_days_left is not none and s.domain_days_left < 30 else '' }}">{{ days(s.domain_days_left) }}</span>
+      (as of today)
+    </p>
+    {% if s.incidents %}
+    <table style="margin-top:12px">
+      <thead><tr><th>Started</th><th class="num">Time to fix</th>{% if internal %}<th class="num">Time to ack</th>{% endif %}<th>Cause</th></tr></thead>
+      <tbody>
+      {% for i in s.incidents %}
+        <tr>
+          <td style="white-space:nowrap">{{ i.started_at | when }}</td>
+          <td class="num">{% if i.ongoing %}<span class="bad">ongoing</span>{% else %}{{ i.duration_s | duration }}{% endif %}</td>
+          {% if internal %}<td class="num">{% if i.acknowledged_at %}{{ (i.acknowledged_at - i.started_at) | duration }}{% else %}<span class="warn">not acked</span>{% endif %}</td>{% endif %}
+          <td>{{ i.cause_label }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="ok" style="margin:12px 0 0">No incidents this period.</p>
+    {% endif %}
+  </div>
+  {% endfor %}
+
+  {% if internal and rel %}
+  <div class="card">
+    <h2>Reliability (internal)</h2>
+    <p class="muted">MTTA = time from first failure to "acknowledge". MTTR = time from first failure to recovery.</p>
+    <table>
+      <thead><tr><th>Site</th><th class="num">Uptime</th><th class="num">Incidents</th><th class="num">Downtime</th><th class="num">MTTA</th><th class="num">MTTR</th><th>Top cause</th></tr></thead>
+      <tbody>
+      {% for name, r in rel.sites.items() %}
+        <tr><td>{{ name }}</td><td class="num">{{ r.uptime_pct | pct }}</td><td class="num">{{ r.incidents }}</td>
+          <td class="num">{{ r.downtime_s | duration }}</td><td class="num">{{ r.mtta_s | duration }}</td><td class="num">{{ r.mttr_s | duration }}</td>
+          <td>{% if r.top_causes %}{{ r.top_causes[0].label }} &times;{{ r.top_causes[0].count }}{% else %}-{% endif %}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <h2 style="margin-top:18px">Top causes per server</h2>
+    {% for server, r in rel.servers.items() %}
+      <p style="margin:6px 0 2px"><strong>{{ server }}</strong> <span class="muted">&middot; {{ r.incidents }} incident(s), {{ r.unacknowledged }} not acknowledged</span></p>
+      {% if r.top_causes %}
+      <table><tbody>
+        {% for c in r.top_causes %}<tr><td>{{ c.label }}</td><td class="num">&times;{{ c.count }}</td><td class="num">{{ c.downtime_s | duration }} down</td></tr>{% endfor %}
+      </tbody></table>
+      {% else %}<p class="ok" style="margin:2px 0">No incidents.</p>{% endif %}
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  <p class="muted" style="text-align:center">Uptime is measured by independent checks every few minutes from outside the hosting server.</p>
+</div>
+</body>
+</html>

@@ -34,6 +34,12 @@ def send_daily_report(cfg: Config, monitor: Monitor) -> None:
         log.warning("Daily report not sent: none of the channels %s is configured", cfg.daily_report.channels)
 
 
+def send_monthly_reports(cfg: Config, monitor: Monitor) -> None:
+    from . import sla
+    reports = sla.send_monthly(cfg, monitor.storage, monitor.notifier)  # last month
+    log.info("Monthly reports done: %s", ", ".join(r.client_id for r in reports) or "none")
+
+
 def purge_old_data(cfg: Config, monitor: Monitor) -> None:
     removed = monitor.storage.purge(cfg.general.retention_days)
     log.info("Retention: removed %s row(s) older than %d days", removed, cfg.general.retention_days)
@@ -53,6 +59,11 @@ def build_scheduler(cfg: Config, monitor: Monitor) -> BackgroundScheduler:
         hour, minute = (int(x) for x in cfg.daily_report.time.split(":"))
         sched.add_job(_guard("daily_report", lambda: send_daily_report(cfg, monitor)),
                       CronTrigger(hour=hour, minute=minute, timezone=tz), id="daily_report", name="daily_report")
+    if cfg.monthly_report.enabled:
+        hour, minute = (int(x) for x in cfg.monthly_report.time.split(":"))
+        sched.add_job(_guard("monthly_report", lambda: send_monthly_reports(cfg, monitor)),
+                      CronTrigger(day=cfg.monthly_report.day, hour=hour, minute=minute, timezone=tz),
+                      id="monthly_report", name="monthly_report")
     sched.add_job(_guard("purge", lambda: purge_old_data(cfg, monitor)),
                   CronTrigger(hour=3, minute=30, timezone=tz), id="purge", name="purge")
     log.info("Scheduled: checks every %d min, daily report %s, purge 03:30 (%s)",

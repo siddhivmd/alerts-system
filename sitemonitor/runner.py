@@ -255,6 +255,7 @@ class Monitor:
 
     def _save(self, cycle: CycleResult) -> None:
         try:
+            rows = []
             for r, d in zip(cycle.results, cycle.diagnoses):
                 site_id = self.site_ids.get(r.site)
                 if site_id is None:
@@ -267,8 +268,8 @@ class Monitor:
                     details["result"] = r.to_dict()
                     details["diagnosis"] = d.to_dict()
                 code = d.cause_code or (d.warnings[0].code if d.warnings else None)
-                self.storage.record_check(site_id, r.ts, d.status, r.http_status, r.response_ms, code,
-                                          d.summary, details)
+                rows.append((site_id, r.ts, d.status, r.http_status, r.response_ms, code, d.summary, details))
+            self.storage.record_checks(rows)  # one transaction for the whole cycle
             if cycle.reach is not None:
                 st = cycle.stats
                 self.storage.record_vps(

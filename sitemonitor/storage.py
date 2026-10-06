@@ -116,6 +116,8 @@ MIGRATIONS = [
     ("site_state", "escalated_at", "REAL"),
     ("site_state", "recovery_pending", "INTEGER"),
     ("site_state", "recovery_pending_escalation", "INTEGER"),
+    ("incidents", "acknowledged_at", "REAL"),
+    ("incidents", "acknowledged_by", "TEXT"),
 ]
 
 
@@ -150,6 +152,7 @@ class Storage:
         conn = sqlite3.connect(self.path, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA synchronous=NORMAL")  # WAL mode: crash-safe, far fewer disk syncs
         try:
             yield conn
             conn.commit()
@@ -178,6 +181,17 @@ class Storage:
                 " VALUES (?,?,?,?,?,?,?,?)",
                 (site_id, ts, status, http_status, response_ms, cause_code, summary,
                  json.dumps(details, default=str)))
+
+    def record_checks(self, rows: list[tuple[int, float, str, int | None, int | None, str | None, str,
+                                            dict[str, Any]]]) -> None:
+        """Insert many checks in ONE transaction (a cycle's results; much faster than one commit each)."""
+        if not rows:
+            return
+        with self._conn() as conn:
+            conn.executemany(
+                "INSERT INTO checks(site_id, ts, status, http_status, response_ms, cause_code, summary, details)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                [(*r[:7], json.dumps(r[7], default=str)) for r in rows])
 
     def latest_checks(self) -> list[dict[str, Any]]:
         """Most recent check per site (sites without checks are included with NULLs)."""
@@ -250,6 +264,19 @@ class Storage:
     def update_incident_cause(self, incident_id: int, cause_code: str, cause: str) -> None:
         with self._conn() as conn:
             conn.execute("UPDATE incidents SET cause_code=?, cause=? WHERE id=?", (cause_code, cause, incident_id))
+
+    def acknowledge_incident(self, incident_id: int, by: str, ts: float) -> bool:
+        """Mark an incident as being handled. Returns False if it does not exist or was already acked."""
+        with self._conn() as conn:
+            return conn.execute("UPDATE incidents SET acknowledged_at=?, acknowledged_by=? "
+                                "WHERE id=? AND acknowledged_at IS NULL", (ts, by[:80], incident_id)).rowcount == 1
+
+    def open_incident_for(self, site_name: str) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            r = conn.execute("SELECT i.* FROM incidents i JOIN sites s ON s.id = i.site_id "
+                             "WHERE s.name=? AND i.ended_at IS NULL ORDER BY i.started_at DESC LIMIT 1",
+                             (site_name,)).fetchone()
+        return _row(r, json_fields=("details",)) if r else None
 
     def close_incident(self, incident_id: int, ended_at: float) -> None:
         with self._conn() as conn:

@@ -49,6 +49,7 @@ class SiteConfig:
     verify_ssl: bool = True
     public_name: str | None = None  # name shown on the public status page (default: name)
     content_change_alert: float = 70.0  # % of page words that must change suddenly -> defacement warning; 0 = off
+    client: str | None = None  # id of the client (under clients:) this site belongs to
 
     @property
     def hostname(self) -> str:
@@ -185,11 +186,26 @@ class HeartbeatConfig:
 
 
 @dataclass
+class ClientConfig:
+    """A customer whose sites you host: groups sites for SLA reports and status pages."""
+
+    id: str
+    name: str
+    report_to: list[str] = field(default_factory=list)  # who receives this client's monthly SLA report
+    sla_target: float = 99.9  # promised monthly uptime %
+    status_page: bool = False  # publish /status/<id>
+    status_domain: str | None = None  # e.g. status.client.com -> serves this client's status page at /
+
+
+@dataclass
 class MonthlyReportConfig:
     enabled: bool = True
     day: int = 1  # day of the month to send last month's report
     time: str = "09:00"
     channels: list[str] = field(default_factory=lambda: ["email"])
+    send_to_clients: bool = False  # False: every report goes to YOU only, so you can review it first
+    save_html: bool = True  # also save each report as HTML in reports_dir (open it, print to PDF)
+    reports_dir: str = "data/reports"
 
 
 @dataclass
@@ -278,6 +294,7 @@ class Config:
     monthly_report: MonthlyReportConfig = field(default_factory=MonthlyReportConfig)
     status_page: StatusPageConfig = field(default_factory=StatusPageConfig)
     backups: BackupsConfig = field(default_factory=BackupsConfig)
+    clients: dict[str, ClientConfig] = field(default_factory=dict)
     base_dir: Path = Path(".")
     warnings: list[str] = field(default_factory=list)  # features switched off because of missing settings
 
@@ -286,6 +303,7 @@ class Config:
 
 _TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 _BACKUP_GLOB_RE = re.compile(r"^/[A-Za-z0-9_./*?-]+$")
+_CLIENT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
 _PHONE_RE = re.compile(r"^\+?[0-9]{8,15}$")
 
 
@@ -506,6 +524,7 @@ def load_config(path: str | os.PathLike[str] = "config.yaml", env_file: str | No
     if not 1 <= monthly.day <= 28:
         raise ConfigError("monthly_report.day must be between 1 and 28")
     monthly.channels = [str(c).strip().lower() for c in _as_list(monthly.channels)]
+    monthly.reports_dir = _resolve(base, monthly.reports_dir)
     if any(c not in ("email", "telegram", "whatsapp", "console") for c in monthly.channels):
         raise ConfigError("monthly_report.channels takes channel names (email, telegram, whatsapp, console)")
 
@@ -526,6 +545,29 @@ def load_config(path: str | os.PathLike[str] = "config.yaml", env_file: str | No
     dupes = {n for n in names if names.count(n) > 1}
     if dupes:
         raise ConfigError(f"Duplicate site names: {', '.join(sorted(dupes))}")
+
+    # --- clients (optional grouping for SLA reports and status pages)
+    clients_raw = raw.get("clients") or {}
+    if not isinstance(clients_raw, dict):
+        raise ConfigError("'clients' must be a mapping of client id -> settings")
+    clients: dict[str, ClientConfig] = {}
+    for cid, craw in clients_raw.items():
+        cid = str(cid)
+        if not _CLIENT_ID_RE.match(cid):
+            raise ConfigError(f"clients: id {cid!r} may only use lowercase letters, digits and - (it becomes a URL)")
+        craw = dict(craw or {})
+        craw.pop("id", None)  # the mapping key is the id
+        craw.setdefault("name", cid)
+        client = ClientConfig(id=cid, **_pick(craw, ClientConfig, f"clients.{cid}"))
+        client.report_to = [str(a) for a in _as_list(client.report_to)]
+        if not 0 < client.sla_target <= 100:
+            raise ConfigError(f"clients.{cid}.sla_target must be between 0 and 100")
+        if client.status_domain:
+            client.status_domain = client.status_domain.strip().lower()
+        clients[cid] = client
+    unknown_clients = sorted({s.client for s in sites if s.client and s.client not in clients})
+    if unknown_clients:
+        raise ConfigError(f"sites use undefined client(s): {', '.join(unknown_clients)} (add them under clients:)")
 
     # --- security (early warning of "malicious activity")
     sec_raw = _section(raw, "security")
@@ -577,5 +619,5 @@ def load_config(path: str | os.PathLike[str] = "config.yaml", env_file: str | No
 
     return Config(general=general, thresholds=thresholds, alerts=alerts, daily_report=daily,
                   dashboard=dashboard, sites=sites, vps=vps, security=security, heartbeat=heartbeat,
-                  monthly_report=monthly, status_page=status_page, backups=backups, base_dir=base,
-                  warnings=warnings)
+                  monthly_report=monthly, status_page=status_page, backups=backups, clients=clients,
+                  base_dir=base, warnings=warnings)

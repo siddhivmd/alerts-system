@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="60">
+<title>{{ page.title }}</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb; --text: #0b0b0b; --text-2: #52514e; --muted: #898781;
+  --border: rgba(11,11,11,0.10); --grid: #e1e0d9; --none: #e1e0d9;
+  --good: #0ca30c; --good-text: #006300; --warning: #fab219; --warning-text: #8a5a00;
+  --critical: #d03b3b; --critical-text: #b12c2c;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --text: #ffffff; --text-2: #c3c2b7; --muted: #898781;
+    --border: rgba(255,255,255,0.10); --grid: #2c2c2a; --none: #383835;
+    --good-text: #0ca30c; --warning-text: #fab219; --critical-text: #e66767;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --text: #ffffff; --text-2: #c3c2b7; --muted: #898781;
+  --border: rgba(255,255,255,0.10); --grid: #2c2c2a; --none: #383835;
+  --good-text: #0ca30c; --warning-text: #fab219; --critical-text: #e66767;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--page); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 820px; margin: 0 auto; padding: 32px 16px 48px; }
+h1 { font-size: 22px; margin: 0 0 16px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; margin-bottom: 16px; }
+.overall { display: flex; align-items: center; gap: 12px; font-size: 17px; font-weight: 650; }
+.dot { width: 14px; height: 14px; border-radius: 50%; flex: none; }
+.operational .dot { background: var(--good); } .degraded .dot { background: var(--warning); } .outage .dot { background: var(--critical); }
+.state { font-weight: 600; white-space: nowrap; }
+.operational .state { color: var(--good-text); } .degraded .state { color: var(--warning-text); } .outage .state { color: var(--critical-text); }
+.svc { padding: 14px 0; border-bottom: 1px solid var(--grid); }
+.svc:last-child { border-bottom: 0; }
+.svc-head { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+.svc-name { font-weight: 600; }
+.bars { display: flex; gap: 2px; margin-top: 10px; height: 28px; }
+.bar { flex: 1; border-radius: 2px; background: var(--none); min-width: 2px; }
+.bar.ok { background: var(--good); } .bar.minor { background: var(--warning); } .bar.major { background: var(--critical); }
+.bar-axis { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; margin-top: 4px; }
+.meta { color: var(--muted); font-size: 13px; }
+.stale { color: var(--warning-text); font-weight: 600; }
+.inc { padding: 10px 0; border-bottom: 1px solid var(--grid); }
+.inc:last-child { border-bottom: 0; }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; color: var(--text-2); font-size: 12px; margin-top: 4px; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+footer { text-align: center; color: var(--muted); font-size: 12px; margin-top: 24px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>{{ page.title }}</h1>
+
+  <section class="card {{ page.overall }}" aria-live="polite">
+    <div class="overall"><span class="dot" aria-hidden="true"></span>{{ page.headline }}</div>
+    <div class="meta" style="margin-top:6px">
+      {% if page.stale %}<span class="stale">Status may be out of date.</span> {% endif %}
+      Last checked {{ page.last_checked | when if page.last_checked else "never" }} &middot; refreshes every minute
+    </div>
+  </section>
+
+  <section class="card" aria-label="Services">
+    {% for s in page.services %}
+    <div class="svc {{ s.state }}">
+      <div class="svc-head">
+        <span class="svc-name">{{ s.name }}</span>
+        <span class="state">{{ s.label }}</span>
+      </div>
+      <div class="bars" role="img" aria-label="{{ s.name }}: {{ s.uptime | pct }} uptime over the last {{ page.days }} days">
+        {% for b in s.bars %}<span class="bar {{ b.level }}" title="{{ b.date }}: {{ 'no data' if b.uptime is none else (b.uptime | pct) }}"></span>{% endfor %}
+      </div>
+      <div class="bar-axis"><span>{{ page.days }} days ago</span><span>{{ s.uptime | pct }} uptime</span><span>Today</span></div>
+    </div>
+    {% else %}
+    <p class="meta">No services published.</p>
+    {% endfor %}
+    <div class="legend">
+      <span><i style="background:var(--good)"></i>No downtime</span>
+      <span><i style="background:var(--warning)"></i>Minor (99&ndash;99.9%)</span>
+      <span><i style="background:var(--critical)"></i>Major (&lt; 99%)</span>
+      <span><i style="background:var(--none)"></i>No data</span>
+    </div>
+  </section>
+
+  {% if page.incidents %}
+  <section class="card" aria-labelledby="inc-h">
+    <h2 id="inc-h" style="font-size:16px;margin:0 0 6px">Recent disruptions</h2>
+    {% for i in page.incidents %}
+    <div class="inc">
+      <strong>{{ i.service }}</strong> &middot; <span class="{{ 'state' if not i.ended_at else '' }}">{{ i.status }}</span>
+      <div class="meta">{{ i.started_at | when }}{% if i.ended_at %} &ndash; lasted {{ i.duration_s | duration }}{% else %} &ndash; ongoing for {{ i.duration_s | duration }}{% endif %}</div>
+    </div>
+    {% endfor %}
+  </section>
+  {% endif %}
+
+  <footer>Monitored independently every few minutes.</footer>
+</main>
+</body>
+</html>

@@ -87,6 +87,10 @@ select { font: inherit; color: var(--text); background: var(--surface); border: 
 .chip { font-size: 12px; border-radius: 999px; padding: 2px 10px; background: var(--surface-2); color: var(--text-2); }
 .chip.bad { background: var(--critical-wash); color: var(--critical-text); font-weight: 600; }
 .ongoing { color: var(--critical-text); font-weight: 600; }
+.ack-btn { font: inherit; font-size: 12px; font-weight: 600; color: var(--text); background: var(--surface-2);
+  border: 1px solid var(--border); border-radius: 6px; padding: 3px 10px; cursor: pointer; }
+.ack-btn:hover { border-color: var(--axis); }
+.ack-btn:disabled { opacity: .6; cursor: default; }
 .sec-list { list-style: none; margin: 0; padding: 0; }
 .sec-list li { padding: 8px 0; border-bottom: 1px solid var(--grid); }
 .sec-list li:last-child { border-bottom: 0; }
@@ -163,10 +167,22 @@ select { font: inherit; color: var(--text); background: var(--surface); border: 
     <h2 id="inc-title">Incident history</h2>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Site</th><th>Started</th><th>Ended</th><th class="num">Duration</th><th>Cause</th></tr></thead>
+        <thead><tr><th>Site</th><th>Started</th><th>Ended</th><th class="num">Duration</th><th>Cause</th><th>Acknowledged</th></tr></thead>
         <tbody id="incidents"></tbody>
       </table>
     </div>
+  </section>
+
+  <section class="card" aria-labelledby="rel-title">
+    <h2 id="rel-title">Reliability, last 30 days</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Site</th><th class="num">Uptime</th><th class="num">Incidents</th><th class="num">Downtime</th>
+          <th class="num" title="Mean time to acknowledge">MTTA</th><th class="num" title="Mean time to recover">MTTR</th><th>Top cause</th></tr></thead>
+        <tbody id="reliability"></tbody>
+      </table>
+    </div>
+    <div class="sec-meta" id="rel-servers"></div>
   </section>
 </main>
 
@@ -431,15 +447,70 @@ select { font: inherit; color: var(--text); background: var(--surface); border: 
   function renderIncidents(list) {
     const body = document.getElementById("incidents");
     body.replaceChildren();
-    if (!list.length) { body.append(el("tr", {}, el("td", { colspan: 5, class: "empty", text: "No incidents recorded." }))); return; }
+    if (!list.length) { body.append(el("tr", {}, el("td", { colspan: 6, class: "empty", text: "No incidents recorded." }))); return; }
     for (const i of list) {
       const dur = (i.ended_at || Date.now() / 1000) - i.started_at;
+      let ack;
+      if (i.acknowledged_at) {
+        ack = el("td", { class: "meta", text: `${i.acknowledged_by || "someone"}, after ${fmtDur(i.acknowledged_at - i.started_at)}` });
+      } else if (!i.ended_at) {
+        const btn = el("button", { class: "ack-btn", type: "button", text: "Acknowledge" });
+        btn.title = "I'm on it: stops the reminder and escalation emails for this incident";
+        btn.addEventListener("click", () => acknowledge(i.id, btn));
+        ack = el("td", {}, btn);
+      } else {
+        ack = el("td", { class: "meta", text: "not acknowledged" });
+      }
       body.append(el("tr", {},
         el("td", { class: "site-name", text: i.site_name }),
         el("td", { text: fmtTime(i.started_at) }),
         el("td", i.ended_at ? { text: fmtTime(i.ended_at) } : { class: "ongoing", text: "Ongoing" }),
         el("td", { class: "num", text: fmtDur(dur) }),
-        el("td", { class: "why", text: i.cause || "" })));
+        el("td", { class: "why", text: i.cause || "" }),
+        ack));
+    }
+  }
+
+  async function acknowledge(id, btn) {
+    btn.disabled = true; btn.textContent = "Saving...";
+    let who = "";
+    try { who = localStorage.getItem("sm-ack-name") || ""; } catch (e) {}
+    who = (window.prompt("Your name (shown on the incident):", who) || "").trim();
+    if (!who) { btn.disabled = false; btn.textContent = "Acknowledge"; return; }
+    try { localStorage.setItem("sm-ack-name", who); } catch (e) {}
+    try {
+      const r = await fetch(`api/incidents/${id}/ack`, { method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json", "X-Requested-With": "SiteMonitor" }, body: JSON.stringify({ by: who }) });
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.status);
+      refresh();
+    } catch (e) {
+      btn.disabled = false; btn.textContent = "Acknowledge";
+      window.alert(`Could not acknowledge: ${e.message}`);
+    }
+  }
+
+  function renderReliability(rel) {
+    const body = document.getElementById("reliability");
+    body.replaceChildren();
+    const sites = Object.entries((rel && rel.sites) || {});
+    if (!sites.length) { body.append(el("tr", {}, el("td", { colspan: 7, class: "empty", text: "No data yet." }))); return; }
+    const dur = v => v == null ? "-" : fmtDur(v);
+    for (const [name, r] of sites) {
+      const top = r.top_causes && r.top_causes[0];
+      body.append(el("tr", {},
+        el("td", { class: "site-name", text: name }),
+        el("td", { class: "num", text: r.uptime_pct == null ? "-" : `${r.uptime_pct.toFixed(2)}%` }),
+        el("td", { class: "num", text: String(r.incidents) }),
+        el("td", { class: "num", text: r.incidents ? dur(r.downtime_s) : "-" }),
+        el("td", { class: "num", text: dur(r.mtta_s) }),
+        el("td", { class: "num", text: dur(r.mttr_s) }),
+        el("td", { class: "why", text: top ? `${top.label} (x${top.count})` : "-" })));
+    }
+    const meta = document.getElementById("rel-servers");
+    meta.replaceChildren();
+    for (const [server, r] of Object.entries(rel.servers || {})) {
+      const causes = (r.top_causes || []).map(c => `${c.label} x${c.count}`).join(" · ") || "no incidents";
+      meta.append(el("div", { text: `${server}: ${r.incidents} incident(s), ${r.unacknowledged} not acknowledged. Top causes: ${causes}` }));
     }
   }
 
@@ -472,13 +543,15 @@ select { font: inherit; color: var(--text); background: var(--surface); border: 
   async function refresh() {
     try {
       const opts = { credentials: "same-origin", cache: "no-store" };
-      const [status, history, incidents] = await Promise.all([
+      const [status, history, incidents, rel] = await Promise.all([
         fetch("api/status", opts).then(r => r.json()),
         fetch("api/history?hours=24", opts).then(r => r.json()),
-        fetch("api/incidents?limit=50", opts).then(r => r.json())]);
+        fetch("api/incidents?limit=50", opts).then(r => r.json()),
+        fetch("api/reliability?days=30", opts).then(r => r.json())]);
       state.status = status; state.history = history;
       renderAll();
       renderIncidents(incidents.incidents);
+      renderReliability(rel);
     } catch (e) {
       document.getElementById("updated").textContent = "Refresh failed - retrying in 30 s";
     }

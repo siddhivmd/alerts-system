@@ -4,7 +4,10 @@
   python monitor.py run            start the scheduler and the dashboard (long-running)
   python monitor.py check          one-off check of every site, print the diagnosis
   python monitor.py test-alerts    send a test email / Telegram message
-  python monitor.py report         print (or --send) the daily summary
+  python monitor.py report         print (or --send) the daily summary; --monthly for SLA reports
+  python monitor.py ack SITE       acknowledge a site's open incident ("I'm on it")
+  python monitor.py pause 30m      maintenance mode: mute alerts (all sites or --site); resume to end
+  python monitor.py accept-content accept an intended page redesign (defacement baseline)
 
 Run it on a machine that is NOT the monitored VPS (see README).
 """
@@ -16,6 +19,7 @@ import logging
 import signal
 import sys
 import threading
+import time
 from typing import Any
 
 from sitemonitor.alerts import Notifier
@@ -162,11 +166,96 @@ def cmd_report(args: argparse.Namespace) -> int:
     cfg = _load(args)
     storage = Storage(cfg.general.database)
     storage.sync_sites([(s.name, s.url) for s in cfg.sites])
+    if args.monthly or args.month:
+        return _monthly_report(cfg, storage, args)
     subject, body = build_daily_report(cfg, storage)
     print(subject, "\n", body, sep="\n")
     if args.send:
         results = Notifier(cfg.alerts, cfg.general.timezone).send(subject, body, only=cfg.daily_report.channels)
         print(f"\nSent: {results or 'no matching channels configured'}")
+    return 0
+
+
+def _monthly_report(cfg: Config, storage: Storage, args: argparse.Namespace) -> int:
+    from sitemonitor import sla
+    try:
+        year, month = sla.parse_month(args.month) if args.month else sla.previous_month(time.time(),
+                                                                                         cfg.general.timezone)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    if args.client and args.client not in cfg.clients:
+        print(f"Unknown client {args.client!r}. Defined clients: {', '.join(cfg.clients) or 'none'}", file=sys.stderr)
+        return 2
+    reports = sla.send_monthly(cfg, storage, Notifier(cfg.alerts, cfg.general.timezone), year, month,
+                               send=args.send, only_client=args.client)
+    for r in reports:
+        print("=" * 78)
+        print(r.subject)
+        print(f"To: {', '.join(r.recipients) or '(no recipients)'}" + ("  [preview: client not emailed]" if r.preview
+                                                                      else ""))
+        if r.path:
+            print(f"Saved: {r.path}  (open in a browser; Print > Save as PDF)")
+        print("-" * 78)
+        print(r.text)
+    if not reports:
+        print("No sites to report on.")
+    elif not args.send:
+        print("\n(Not sent. Add --send to email these reports.)")
+    return 0
+
+
+def cmd_ack(args: argparse.Namespace) -> int:
+    cfg = _load(args)
+    storage = Storage(cfg.general.database)
+    incident = storage.open_incident_for(args.site)
+    if incident is None:
+        print(f"No open incident for {args.site!r}.")
+        return 1
+    if not storage.acknowledge_incident(incident["id"], args.by, time.time()):
+        print(f"Incident for {args.site!r} was already acknowledged by {incident.get('acknowledged_by')}.")
+        return 1
+    print(f"Acknowledged {args.site!r} (down since {time.strftime('%Y-%m-%d %H:%M', time.localtime(incident['started_at']))}) "
+          f"as {args.by}. Reminders and escalation are stopped; you will still get the RECOVERED alert.")
+    return 0
+
+
+def cmd_pause(args: argparse.Namespace) -> int:
+    from sitemonitor import maintenance
+    cfg = _load(args)
+    try:
+        minutes = maintenance.parse_duration(args.duration)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    unknown = set(args.site or []) - {s.name for s in cfg.sites}
+    if unknown:
+        print(f"Unknown site(s): {', '.join(sorted(unknown))}", file=sys.stderr)
+        return 2
+    record = maintenance.start(Storage(cfg.general.database), minutes, args.site, args.reason or "")
+    until = time.strftime("%Y-%m-%d %H:%M", time.localtime(record["until"]))
+    print(f"Maintenance mode until {until}: alerts paused for {', '.join(record['sites']) or 'ALL sites and the server'}. "
+          "Checks keep running. End early with: python monitor.py resume")
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    from sitemonitor import maintenance
+    cfg = _load(args)
+    was_active = maintenance.end(Storage(cfg.general.database))
+    print("Maintenance mode ended: alerts are active again." if was_active else "Maintenance mode was not active.")
+    return 0
+
+
+def cmd_accept_content(args: argparse.Namespace) -> int:
+    from sitemonitor import content
+    cfg = _load(args)
+    if args.site and args.site not in {s.name for s in cfg.sites}:
+        print(f"Unknown site {args.site!r}", file=sys.stderr)
+        return 2
+    content.accept(Storage(cfg.general.database), args.site)
+    print(f"Page-text baseline reset for {args.site or 'all sites'}: the next healthy check records the current "
+          "page as the new normal.")
     return 0
 
 
@@ -198,7 +287,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     sched.start()
     try:
         dash = cfg.dashboard
-        if dash.enabled and not args.no_dashboard:
+        # The web server also serves the public status page, so it runs if either is enabled.
+        if (dash.enabled or cfg.status_page.enabled) and not args.no_dashboard:
             app = create_app(cfg, storage, lambda: monitor.last_cycle.ts if monitor.last_cycle else None,
                              lambda: monitor.last_cycle.problems if monitor.last_cycle else [])
             serve(app, dash.host, dash.port)
@@ -236,9 +326,30 @@ def build_parser() -> argparse.ArgumentParser:
     t = sub.add_parser("test-alerts", help="send a test message on every enabled channel")
     t.set_defaults(func=cmd_test_alerts)
 
-    rep = sub.add_parser("report", help="print the daily summary (from stored history)")
-    rep.add_argument("--send", action="store_true", help="also send it on the daily_report channels")
+    rep = sub.add_parser("report", help="print the daily summary, or the monthly SLA reports (--monthly)")
+    rep.add_argument("--send", action="store_true", help="also send it (daily: daily_report channels)")
+    rep.add_argument("--monthly", action="store_true", help="monthly SLA report per client + internal reliability")
+    rep.add_argument("--month", help="which month, YYYY-MM (default: last month); implies --monthly")
+    rep.add_argument("--client", help="only this client id (monthly)")
     rep.set_defaults(func=cmd_report)
+
+    a = sub.add_parser("ack", help="acknowledge a site's open incident: stops reminders and escalation")
+    a.add_argument("site", help="site name as in config.yaml")
+    a.add_argument("--by", default="cli", help="your name (shown on the incident)")
+    a.set_defaults(func=cmd_ack)
+
+    pz = sub.add_parser("pause", help="maintenance mode: mute alerts for a while (checks keep running)")
+    pz.add_argument("duration", help="e.g. 30m, 2h, 1d")
+    pz.add_argument("--site", action="append", help="only this site (repeatable); default: everything")
+    pz.add_argument("--reason", help="shown in the log, e.g. 'server upgrade'")
+    pz.set_defaults(func=cmd_pause)
+
+    rs = sub.add_parser("resume", help="end maintenance mode now")
+    rs.set_defaults(func=cmd_resume)
+
+    ac = sub.add_parser("accept-content", help="accept an intended page change (resets the defacement baseline)")
+    ac.add_argument("--site", help="only this site (default: all)")
+    ac.set_defaults(func=cmd_accept_content)
     return p
 
 

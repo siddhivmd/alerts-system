@@ -242,7 +242,7 @@ def test_disk_full_makes_the_watchdog_fail_not_ok(cfg, monitor):
 
     def disk_full(*args, **kwargs):
         raise sqlite3.OperationalError("database or disk is full")
-    monitor.storage.record_check = disk_full
+    monitor.storage.record_checks = disk_full
     cycle = monitor.run_cycle()
     assert cycle.problems and "disk full?" in cycle.problems[0]
     assert pings[-1][0] is False and "database or disk is full" in pings[-1][1]
