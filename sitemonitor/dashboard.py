@@ -98,7 +98,8 @@ def build_status(cfg: Config, storage: Storage) -> dict[str, Any]:
             "sites": sites, "vps": vps, "security": security, "monitor": monitor_state}
 
 
-def create_app(cfg: Config, storage: Storage, last_cycle: Callable[[], float | None] | None = None) -> Flask:
+def create_app(cfg: Config, storage: Storage, last_cycle: Callable[[], float | None] | None = None,
+               last_problems: Callable[[], list[str]] | None = None) -> Flask:
     app = Flask(__name__)
     app.config["JSON_SORT_KEYS"] = False
     auth = _requires_auth(cfg)
@@ -145,8 +146,12 @@ def create_app(cfg: Config, storage: Storage, last_cycle: Callable[[], float | N
     def healthz() -> tuple[Response, int]:
         ts = last_cycle() if last_cycle else None
         stale_after = cfg.general.check_interval_minutes * 60 * 3 + 120
-        healthy = ts is not None and time.time() - ts < stale_after
-        return jsonify({"ok": healthy, "last_cycle": ts}), (200 if healthy else 503)
+        fresh = ts is not None and time.time() - ts < stale_after
+        broken = bool(last_problems and last_problems())  # e.g. disk full: running but not recording
+        healthy = fresh and not broken
+        # Unauthenticated endpoint: say THAT something is wrong, never the internal details.
+        reason = None if healthy else ("no recent check cycle" if not fresh else "internal error (see the log)")
+        return jsonify({"ok": healthy, "last_cycle": ts, "reason": reason}), (200 if healthy else 503)
 
     return app
 

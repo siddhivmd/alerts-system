@@ -199,7 +199,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     try:
         dash = cfg.dashboard
         if dash.enabled and not args.no_dashboard:
-            app = create_app(cfg, storage, lambda: monitor.last_cycle.ts if monitor.last_cycle else None)
+            app = create_app(cfg, storage, lambda: monitor.last_cycle.ts if monitor.last_cycle else None,
+                             lambda: monitor.last_cycle.problems if monitor.last_cycle else [])
             serve(app, dash.host, dash.port)
             return 0
         stop.wait()

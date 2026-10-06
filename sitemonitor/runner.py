@@ -46,6 +46,7 @@ class CycleResult:
     maintenance: dict[str, Any] | None = None  # active maintenance window, if any
     offline: bool = False  # the monitor had no internet: nothing was checked or recorded
     offline_details: dict[str, str] = field(default_factory=dict)  # canary host -> error
+    problems: list[str] = field(default_factory=list)  # internal failures (e.g. disk full): heartbeat says FAIL
     duration: float = 0.0
 
     @property
@@ -96,9 +97,14 @@ class Monitor:
         finally:
             self._cycle_lock.release()
         if alert and not cycle.offline:  # only real cycles count as "alive"; offline: the ping can't arrive
-            up = sum(d.status != DOWN for d in cycle.diagnoses)
-            self.heartbeat.ping(ok=True, message=f"{up} up, {len(cycle.down)} down, "
-                                                 f"{len(cycle.events)} alert event(s)")
+            if cycle.problems:
+                # The process runs but is not doing its job (e.g. disk full, database locked):
+                # that must not look like "all fine" to the watchdog.
+                self.heartbeat.ping(ok=False, message="Monitor is running but broken: " + "; ".join(cycle.problems))
+            else:
+                up = sum(d.status != DOWN for d in cycle.diagnoses)
+                self.heartbeat.ping(ok=True, message=f"{up} up, {len(cycle.down)} down, "
+                                                     f"{len(cycle.events)} alert event(s)")
         return cycle
 
     # ------------------------------------------------------------------ internals
@@ -272,8 +278,9 @@ class Monitor:
             self.storage.set_kv("server_status", {
                 "ts": cycle.ts, "name": self.server_key, "security": cycle.security,
                 "warnings": [w.__dict__ for w in cycle.vps_warnings]})
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             log.exception("Saving check results failed")
+            cycle.problems.append(f"saving results failed ({type(exc).__name__}: {exc}) - disk full?")
 
     def _alert(self, cycle: CycleResult) -> None:
         events: list[AlertEvent] = []
@@ -289,8 +296,9 @@ class Monitor:
                     events += self.alerts.evaluate_warnings(d.site, d.warnings, cycle.ts)
             if not maintenance.mutes(window, None):
                 events += self.alerts.evaluate_warnings(self.server_key, cycle.vps_warnings, cycle.ts)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             log.exception("Alert evaluation failed")
+            cycle.problems.append(f"alert evaluation failed ({type(exc).__name__}: {exc})")
         if window:
             log.info("Maintenance mode until %s: alerts paused for %s", time.strftime(
                 "%H:%M", time.localtime(window["until"])), ", ".join(window["sites"]) or "all sites")

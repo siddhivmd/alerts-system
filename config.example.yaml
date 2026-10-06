@@ -79,6 +79,13 @@ alerts:
     enabled: false               # needs TELEGRAM_BOT_TOKEN in .env and chat_ids
     chat_ids: ["123456789"]      # user or group chat ids (see README for how to find them)
 
+# Dead-man's switch: the monitor cannot report its own death, so after every cycle it pings an
+# outside service (free: healthchecks.io). If the pings stop - VM down, crashed, frozen - or a cycle
+# reports failure (e.g. disk full), THAT service emails you. Ping URL goes in .env as HEARTBEAT_URL.
+heartbeat:
+  enabled: false
+  fail_suffix: "/fail"           # healthchecks.io / Better Stack: <url>/fail = "I'm running but broken"
+
 # Early warning of the "malicious activity" that gets VPS accounts suspended.
 # All optional; delete the section to use these defaults, or set enabled: false.
 security:

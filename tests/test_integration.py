@@ -234,6 +234,33 @@ def test_monitor_internet_outage_creates_no_fake_incidents(monitor):
     assert pings == [True]
 
 
+def test_disk_full_makes_the_watchdog_fail_not_ok(cfg, monitor):
+    """Running-but-broken (e.g. disk full) must not look like "all fine" to the dead-man's switch."""
+    import sqlite3
+    pings = []
+    monitor.heartbeat.ping = lambda ok=True, message="": pings.append((ok, message))
+
+    def disk_full(*args, **kwargs):
+        raise sqlite3.OperationalError("database or disk is full")
+    monitor.storage.record_check = disk_full
+    cycle = monitor.run_cycle()
+    assert cycle.problems and "disk full?" in cycle.problems[0]
+    assert pings[-1][0] is False and "database or disk is full" in pings[-1][1]
+
+    app = create_app(cfg, monitor.storage, lambda: monitor.last_cycle.ts, lambda: monitor.last_cycle.problems)
+    resp = app.test_client().get("/healthz")
+    assert resp.status_code == 503
+    assert resp.get_json()["reason"] == "internal error (see the log)"   # no internal details leaked
+    assert "disk" not in resp.get_data(as_text=True)
+
+
+def test_healthy_cycle_pings_ok(monitor):
+    pings = []
+    monitor.heartbeat.ping = lambda ok=True, message="": pings.append(ok)
+    monitor.run_cycle()
+    assert pings == [True]
+
+
 def test_real_outage_while_online_still_alerts(monitor):
     """The canary must not hide real outages: online + site down -> DOWN alert as before."""
     monitor.test_state["a_down"] = True

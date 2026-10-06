@@ -48,6 +48,36 @@ Each diagnosis includes a concrete fix, for example `sudo systemctl restart ngin
 
 **Warnings** don't mark a site as down: slow response (above `slow_threshold_ms`), SSL or domain expiring soon, and VPS disk / RAM / CPU / service problems.
 
+## Watching the monitor itself (dead-man's switch)
+
+A monitor can't report its own death. If the monitoring VM dies, freezes, crashes or runs out of disk, the result is silence, and silence looks exactly like "everything is fine". So the monitor checks in with an outside service after every cycle:
+
+| What happens | Ping sent | What the outside service does |
+|---|---|---|
+| A normal cycle | `OK`, e.g. "2 up, 0 down, 0 alert event(s)" | Nothing |
+| A cycle crashed | `/fail`, with the error | Alerts you immediately |
+| The monitor runs but is broken, e.g. **disk full** or a locked database | `/fail`, e.g. "saving results failed ... disk full?" | Alerts you immediately |
+| VM down, process dead, or frozen | **Nothing** | Alerts you after the grace period |
+| The monitor's own internet is down | Nothing (a "monitor offline" cycle) | Alerts you after the grace period |
+
+**Setup (free, about 5 minutes):**
+1. Create an account at [healthchecks.io](https://healthchecks.io) and add a check.
+   - **Period:** your `check_interval_minutes`, i.e. 5 minutes.
+   - **Grace:** 10 minutes. That way one slow cycle doesn't raise an alarm.
+2. Choose how healthchecks.io should alert you: email, Telegram, WhatsApp, Slack and others are available. Use a channel that **doesn't depend on the monitoring machine**.
+3. Copy the check's ping URL into `.env` as `HEARTBEAT_URL=https://hc-ping.com/...`. Keep it secret: anyone with that URL could fake "I'm alive".
+4. In `config.yaml`, set `heartbeat: enabled: true`, then run `python monitor.py run`. Within a cycle the check turns green on healthchecks.io.
+
+Only real cycles ping: scheduled ones, or `check --alert`. A plain `monitor.py check` doesn't, so manual tests can't hide a dead scheduler.
+
+**Second option: UptimeRobot (free) on `/healthz`.**
+- `/healthz` returns **200** while check cycles run on schedule and save their results.
+- It returns **503** if no cycle has run recently, or if the last one hit an internal error such as a full disk.
+- It never shows internal details, because it's a public endpoint.
+- This only works if UptimeRobot can reach the dashboard: set `DASHBOARD_PASSWORD`, put HTTPS in front, and point an HTTP monitor at `https://your-monitor-host/healthz`.
+
+Using both is fine: the heartbeat catches everything, including a dead network, while `/healthz` also confirms the web server is up.
+
 ## Security early warning
 
 Hosts suspend accounts for "malicious activity", meaning the server was sending spam, attacking other servers, or hosting malware. This almost always happens after a site gets hacked. These checks try to spot it before the host does. All of them are optional, and all of them only **read**; nothing on the server is changed.
