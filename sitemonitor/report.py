@@ -45,6 +45,18 @@ def build_daily_report(cfg: Config, storage: Storage, now: float | None = None) 
         lines.append(f"  - {i['site_name']}: {fmt.when(i['started_at'])} -> {end} ({dur}) - {i['cause']}")
     lines.append("")
 
+    # Gaps in monitoring: the monitor's own internet was down, so nothing was checked (not site downtime).
+    conn = storage.get_kv("connectivity") or {}
+    gaps = [(p["from"], p["until"]) for p in conn.get("periods") or [] if p["until"] >= since]
+    if conn.get("offline"):
+        gaps.append((conn.get("since", now), None))
+    if gaps:
+        lines.append("Monitor offline (no checks ran; not counted as site downtime):")
+        for start, end in gaps:
+            lines.append(f"  - {fmt.when(start)} -> {fmt.when(end) if end else 'STILL OFFLINE'} "
+                         f"({format_duration((end or now) - start)})")
+        lines.append("")
+
     if cfg.vps:
         v = storage.latest_vps()
         if v:

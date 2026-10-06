@@ -122,6 +122,13 @@ def cmd_check(args: argparse.Namespace) -> int:
         print(f"Unknown site(s): {', '.join(sorted(unknown))}", file=sys.stderr)
         return 2
     cycle = monitor.run_cycle(save=args.save, alert=args.alert, only=args.site)
+    if cycle.offline:
+        print("MONITOR OFFLINE: this machine has no internet connection, so no site was checked.")
+        print("None of the canary hosts answered:")
+        for host, error in cycle.offline_details.items():
+            print(f"  - {host}: {error}")
+        print("Fix this machine's network (or general.canary_hosts) and run the check again.")
+        return 2
     if args.json:
         out: dict[str, Any] = {
             "vps": cycle.reach.to_dict() if cycle.reach else None,

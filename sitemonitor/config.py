@@ -255,6 +255,13 @@ class GeneralConfig:
     retention_days: int = 90
     timezone: str = "UTC"
     user_agent: str = "SiteMonitor/1.0 (+uptime check)"
+    # Before each cycle, check that the MONITOR itself is online. If none of these answer, the cycle is
+    # skipped ("monitor offline") instead of marking every site DOWN. IPs test routing, names test DNS too.
+    connectivity_check: bool = True
+    canary_hosts: list[str] = field(default_factory=lambda: [
+        "1.1.1.1:443", "8.8.8.8:53", "www.google.com:443", "cloudflare.com:443",
+    ])
+    canary_timeout: float = 4.0
 
 
 @dataclass
@@ -369,6 +376,13 @@ def load_config(path: str | os.PathLike[str] = "config.yaml", env_file: str | No
     general.log_file = _resolve(base, general.log_file)
     if general.check_interval_minutes < 1:
         raise ConfigError("general.check_interval_minutes must be >= 1")
+    general.canary_hosts = [str(h).strip() for h in _as_list(general.canary_hosts) if str(h).strip()]
+    for host in general.canary_hosts:
+        name, _, port = host.rpartition(":")
+        if not name or not port.isdigit() or not 0 < int(port) < 65536:
+            raise ConfigError(f"general.canary_hosts: {host!r} must be host:port, e.g. 1.1.1.1:443")
+    if general.connectivity_check and not general.canary_hosts:
+        raise ConfigError("general.canary_hosts needs at least one host:port (or set connectivity_check: false)")
 
     thresholds = Thresholds(**_pick(_section(raw, "thresholds"), Thresholds, "thresholds"))
 

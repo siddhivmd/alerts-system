@@ -1,4 +1,11 @@
-"""One monitoring cycle: check everything concurrently, diagnose, store, alert."""
+"""One monitoring cycle: check everything concurrently, diagnose, store, alert.
+
+Every cycle first checks that the monitor itself is online (canary hosts). If it
+is not, the cycle is skipped: no site checks, no alert evaluation, no incidents,
+nothing recorded against uptime. Otherwise a network outage on the monitor's
+side would mark every site DOWN and later send RECOVERED for an outage that
+never happened.
+"""
 from __future__ import annotations
 
 import logging
@@ -11,7 +18,7 @@ from typing import Any, TypeVar
 from . import content, maintenance
 from .alerts import AlertEvent, AlertManager, Notifier, escalation_notifier
 from .backups import backup_summary, backup_warnings
-from .checks import SiteCheckResult, VpsReachability, WhoisLookup, check_site, check_vps_ports
+from .checks import SiteCheckResult, VpsReachability, WhoisLookup, check_internet, check_site, check_vps_ports
 from .config import Config, SiteConfig
 from .diagnosis import DOWN, UP, WARNING, Diagnosis, Warn, diagnose, is_failing, vps_warnings
 from .heartbeat import Heartbeat
@@ -21,6 +28,8 @@ from .storage import Storage
 
 log = logging.getLogger(__name__)
 T = TypeVar("T")
+CONNECTIVITY_KEY = "connectivity"  # kv record: current offline state + recent offline periods
+MAX_OFFLINE_PERIODS = 50
 
 
 @dataclass
@@ -35,6 +44,8 @@ class CycleResult:
     events: list[AlertEvent] = field(default_factory=list)
     alerts_delivered: bool | None = None
     maintenance: dict[str, Any] | None = None  # active maintenance window, if any
+    offline: bool = False  # the monitor had no internet: nothing was checked or recorded
+    offline_details: dict[str, str] = field(default_factory=dict)  # canary host -> error
     duration: float = 0.0
 
     @property
@@ -84,7 +95,7 @@ class Monitor:
             raise
         finally:
             self._cycle_lock.release()
-        if alert:  # only real (scheduled / --alert) cycles count as "alive"
+        if alert and not cycle.offline:  # only real cycles count as "alive"; offline: the ping can't arrive
             up = sum(d.status != DOWN for d in cycle.diagnoses)
             self.heartbeat.ping(ok=True, message=f"{up} up, {len(cycle.down)} down, "
                                                  f"{len(cycle.events)} alert event(s)")
@@ -93,6 +104,13 @@ class Monitor:
     # ------------------------------------------------------------------ internals
     def _run(self, save: bool, alert: bool, only: list[str] | None) -> CycleResult:
         started = time.time()
+        general = self.cfg.general
+        if general.connectivity_check:
+            online, details = check_internet(general.canary_hosts, timeout=general.canary_timeout)
+            if not online:
+                return self._offline_cycle(started, details, save)
+            if save:
+                self._record_online(started)
         sites = [s for s in self.cfg.sites if not only or s.name in only]
         vps = self.cfg.vps
         workers = max(1, min(self.cfg.general.max_workers, len(sites) + 2))
@@ -154,6 +172,35 @@ class Monitor:
         log.info("Cycle done in %.1fs: %d site(s), %d down, %d alert event(s)",
                  cycle.duration, len(results), len(cycle.down), len(cycle.events))
         return cycle
+
+    def _offline_cycle(self, ts: float, details: dict[str, str], save: bool) -> CycleResult:
+        """The monitor is offline: check nothing, judge nothing, record only the offline period."""
+        cycle = CycleResult(ts=ts, results=[], diagnoses=[], offline=True, offline_details=details)
+        state = self.storage.get_kv(CONNECTIVITY_KEY) or {}
+        if not state.get("offline"):
+            log.error("MONITOR OFFLINE: none of the canary hosts answer (%s). Skipping checks and alerts until "
+                      "the connection is back, so the outage is not blamed on the sites.",
+                      "; ".join(f"{h}: {e}" for h, e in details.items()))
+        else:
+            log.warning("Monitor still offline (since %s): cycle skipped",
+                        time.strftime("%H:%M", time.localtime(state.get("since", ts))))
+        if save:
+            state.update(offline=True, since=state.get("since") if state.get("offline") else ts, last_seen=ts,
+                         details=details)
+            self.storage.set_kv(CONNECTIVITY_KEY, state)
+        self.last_cycle = cycle
+        return cycle
+
+    def _record_online(self, ts: float) -> None:
+        """Close an open offline period (keeps a short history for the dashboard and daily report)."""
+        state = self.storage.get_kv(CONNECTIVITY_KEY)
+        if not state or not state.get("offline"):
+            return
+        since = state.get("since", ts)
+        log.warning("Monitor back online after %.0f min offline; checks resume (that period is not counted "
+                    "as site downtime)", (ts - since) / 60)
+        periods = (state.get("periods") or []) + [{"from": since, "until": ts}]
+        self.storage.set_kv(CONNECTIVITY_KEY, {"offline": False, "periods": periods[-MAX_OFFLINE_PERIODS:]})
 
     def _check_content(self, sites: list[SiteConfig], results: list[SiteCheckResult],
                        diagnoses: list[Diagnosis], save: bool) -> None:

@@ -137,17 +137,20 @@ class Recorder:
 
 @pytest.fixture
 def monitor(cfg, monkeypatch):
-    state = {"a_down": False}
+    state = {"a_down": False, "online": True}  # online=False simulates the MONITOR losing its network
 
     def fake_check_site(site, whois, ua):
         if site.name == "B":
             raise RuntimeError("boom")  # a crashing check must not break the cycle
-        if state["a_down"]:
+        if state["a_down"] or not state["online"]:  # without internet every site would time out
             return ok_result(site="A", url=site.url, http_status=None, status_ok=None, response_ms=None,
                              error_kind="timeout", error_message="timed out")
         return ok_result(site="A", url=site.url)
 
     monkeypatch.setattr(runner_mod, "check_site", fake_check_site)
+    monkeypatch.setattr(runner_mod, "check_internet", lambda hosts, timeout=4.0: (
+        (True, {"1.1.1.1:443": "ok"}) if state["online"] else
+        (False, {h: "[WinError 10051] Network is unreachable" for h in hosts})))
     monkeypatch.setattr(runner_mod, "check_vps_ports", lambda vps: reach(p22=True, p80=True, p443=True))
     stats = healthy_stats(services={"nginx": {"active": "failed", "sub": "failed", "enabled": "enabled"}})
     monkeypatch.setattr(runner_mod, "collect_stats", lambda host, ssh, security=None, backups=None: stats)
@@ -201,6 +204,54 @@ def test_recovery_alert_resent_after_all_channels_failed(monitor):
     monitor.notifier.working = True
     assert ("recovered", "A") in {(e.kind, e.key) for e in monitor.run_cycle().events}  # retried
     assert ("recovered", "A") not in {(e.kind, e.key) for e in monitor.run_cycle().events}  # and only once
+
+
+def test_monitor_internet_outage_creates_no_fake_incidents(monitor):
+    """Regression: losing the MONITOR's network for 2+ cycles used to mark every site DOWN, open
+    incidents, send RECOVERED for an outage that never happened, and count it against uptime."""
+    pings = []
+    monitor.heartbeat.ping = lambda ok=True, message="": pings.append(ok)
+    monitor.run_cycle()                                           # normal, online
+    checks_before = len(monitor.storage.response_history(0))
+    pings.clear()
+
+    monitor.test_state["online"] = False
+    for _ in range(3):                                            # 3 cycles without internet
+        c = monitor.run_cycle()
+        assert c.offline and c.results == [] and c.events == []
+    assert monitor.storage.incidents() == [i for i in monitor.storage.incidents() if i["site_name"] == "B"]
+    assert len(monitor.storage.response_history(0)) == checks_before   # nothing counted against uptime
+    assert pings == []                                            # no "alive" ping while blind
+    assert monitor.storage.get_kv("connectivity")["offline"] is True
+
+    monitor.test_state["online"] = True
+    c = monitor.run_cycle()
+    assert not c.offline
+    assert ("recovered", "A") not in {(e.kind, e.key) for e in c.events}     # no fake RECOVERED
+    assert all(i["site_name"] != "A" for i in monitor.storage.incidents())   # no fake incident for A
+    conn = monitor.storage.get_kv("connectivity")
+    assert conn["offline"] is False and len(conn["periods"]) == 1             # the gap is recorded
+    assert pings == [True]
+
+
+def test_real_outage_while_online_still_alerts(monitor):
+    """The canary must not hide real outages: online + site down -> DOWN alert as before."""
+    monitor.test_state["a_down"] = True
+    monitor.run_cycle()
+    assert ("down", "A") in {(e.kind, e.key) for e in monitor.run_cycle().events}
+
+
+def test_dashboard_and_report_show_monitor_offline(cfg, monitor):
+    from sitemonitor.report import build_daily_report
+    monitor.run_cycle()
+    monitor.test_state["online"] = False
+    monitor.run_cycle()
+    client = create_app(cfg, monitor.storage).test_client()
+    auth = {"Authorization": "Basic " + base64.b64encode(b"admin:s3cret").decode()}
+    data = client.get("/api/status", headers=auth).get_json()
+    assert data["monitor"]["offline"] is True and data["monitor"]["offline_since"]
+    _, body = build_daily_report(cfg, monitor.storage)
+    assert "Monitor offline" in body and "STILL OFFLINE" in body
 
 
 def test_dashboard_requires_auth_and_serves_status(cfg, monitor):

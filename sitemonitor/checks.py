@@ -355,6 +355,41 @@ def check_site(site: SiteConfig, whois_lookup: WhoisLookup | None = None,
 
 # --------------------------------------------------------------------------- VPS
 
+def check_internet(hosts: list[str], timeout: float = 4.0,
+                   connect: Callable[..., socket.socket] = socket.create_connection) -> tuple[bool, dict[str, str]]:
+    """Canary: is the MONITOR itself online? True as soon as any ``host:port`` accepts a TCP connection.
+
+    Returns (online, details). When offline, details maps every host to the reason it failed.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import TimeoutError as FutureTimeout
+
+    def attempt(target: str) -> str | None:
+        host, _, port = target.rpartition(":")
+        try:
+            connect((host.strip("[]"), int(port)), timeout=timeout).close()
+            return None
+        except OSError as exc:
+            return str(exc) or type(exc).__name__
+
+    errors: dict[str, str] = {}
+    ex = ThreadPoolExecutor(max_workers=max(1, len(hosts)), thread_name_prefix="canary")
+    futures = {ex.submit(attempt, h): h for h in hosts}
+    try:
+        # getaddrinfo() has no timeout of its own, so bound the whole wait as well.
+        for fut in as_completed(futures, timeout=timeout + 2):
+            error = fut.result()
+            if error is None:
+                return True, {futures[fut]: "ok"}
+            errors[futures[fut]] = error
+    except FutureTimeout:
+        for fut, host in futures.items():
+            errors.setdefault(host, f"no answer within {timeout:.0f}s")
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+    return False, errors
+
+
 def check_vps_ports(vps: VpsConfig, connect: Callable[..., socket.socket] = socket.create_connection
                     ) -> VpsReachability:
     """TCP-connect to each configured port. All closed => VPS down or suspended."""

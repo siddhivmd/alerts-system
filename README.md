@@ -76,6 +76,13 @@ Notes:
 ## How alerts are sent
 
 - **2 failures in a row** before a DOWN alert. This filters out one-off network blips.
+- **The monitor's own internet is checked first.** Each cycle starts with a quick "canary" test: it connects to well-known hosts (`1.1.1.1`, `8.8.8.8`, `www.google.com`, `cloudflare.com`; set in `general.canary_hosts`). If none of them answer, the problem is the monitoring machine, not your sites. That cycle is skipped:
+  - no sites are checked
+  - no incidents are opened
+  - nothing counts against uptime
+  - no fake RECOVERED message is sent afterwards
+
+  The offline period is logged, shown on the dashboard, and listed in the daily report as "Monitor offline (no checks ran)". No alert can be sent without internet, so use the watchdog heartbeat (`heartbeat:` with `HEARTBEAT_URL` in `.env`) to hear about it: the heartbeat pings stop, and healthchecks.io alerts you.
 - **DOWN**: sent immediately once confirmed. It includes the cause, the fixes, the evidence and the error-log lines.
 - **Still down**: the same cause is repeated at most once every **30 minutes**. If the cause changes (e.g. nginx down becomes disk full), you get an alert right away.
 - **RECOVERED**: sent on the first successful check. It includes the **downtime**, measured from the first failed check.

@@ -450,9 +450,18 @@ select { font: inherit; color: var(--text); background: var(--surface); border: 
     document.getElementById("updated").textContent = `Updated ${new Date(st.generated_at * 1000).toLocaleTimeString()} · checks every ${st.check_interval_minutes} min`;
     const banner = document.getElementById("banner");
     const down = st.sites.filter(s => s.status === "down");
-    banner.style.display = down.length ? "block" : "none";
-    banner.textContent = down.length ? `${down.length} site(s) down: ${down.map(s => s.name).join(", ")}` : "";
-    document.title = down.length ? `(${down.length} down) Site Monitor` : "Site Monitor";
+    const mon = st.monitor || {};
+    if (mon.offline) {
+      // The monitor itself has no internet: site statuses below are from before the outage.
+      banner.style.display = "block";
+      banner.textContent = `This monitor has had no internet connection since ${fmtTime(mon.offline_since)}. ` +
+        "Checks are paused and this time is not counted as site downtime. The statuses below are from before the outage.";
+      document.title = "(monitor offline) Site Monitor";
+    } else {
+      banner.style.display = down.length ? "block" : "none";
+      banner.textContent = down.length ? `${down.length} site(s) down: ${down.map(s => s.name).join(", ")}` : "";
+      document.title = down.length ? `(${down.length} down) Site Monitor` : "Site Monitor";
+    }
     renderVps(st.vps);
     renderSecurity(st.security);
     renderSelect(st.sites);

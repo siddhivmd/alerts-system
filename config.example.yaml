@@ -16,6 +16,11 @@ general:
   retention_days: 90             # check history older than this is deleted nightly (incidents are kept)
   timezone: Asia/Kolkata         # used for the daily report time and times shown in alerts
   user_agent: "SiteMonitor/1.0 (+uptime check)"
+  # Before each cycle, check that THIS machine is online. If none of these answer, the cycle is
+  # skipped ("monitor offline") instead of marking every site DOWN and sending fake alerts.
+  connectivity_check: true
+  canary_hosts: ["1.1.1.1:443", "8.8.8.8:53", "www.google.com:443", "cloudflare.com:443"]
+  canary_timeout: 4
 
 thresholds:
   ram_percent: 90                # RAM above this is reported as a cause when a site is down
