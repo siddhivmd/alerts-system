@@ -3,11 +3,16 @@ import pytest
 from conftest import healthy_stats
 
 from sitemonitor import content, maintenance
-from sitemonitor.alerts import (AlertManager, Formatter, WhatsAppChannel, escalation_notifier,
-                                flatten_for_template, whatsapp_text)
+from sitemonitor.alerts import (
+    AlertManager,
+    Formatter,
+    WhatsAppChannel,
+    escalation_notifier,
+    flatten_for_template,
+    whatsapp_text,
+)
 from sitemonitor.backups import backup_summary, backup_warnings
-from sitemonitor.config import (AlertsConfig, BackupsConfig, EmailConfig, EscalationConfig, SiteConfig,
-                                WhatsAppConfig)
+from sitemonitor.config import AlertsConfig, BackupsConfig, EmailConfig, EscalationConfig, SiteConfig, WhatsAppConfig
 from sitemonitor.diagnosis import DOWN, UP, Diagnosis
 from sitemonitor.pagetext import change_percent, defacement_match, page_words
 from sitemonitor.ssh_stats import parse_stats

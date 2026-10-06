@@ -85,7 +85,7 @@ def print_cycle(cycle: CycleResult, cfg: Config) -> None:
     if sec.get("enabled") or cycle.vps_warnings:
         print()
 
-    for r, d in zip(cycle.results, cycle.diagnoses):
+    for r, d in zip(cycle.results, cycle.diagnoses, strict=True):
         timing = f"{r.response_ms} ms" if r.response_ms is not None else "no response"
         status = f"HTTP {r.http_status}" if r.http_status else ""
         print(f"{paint.get(d.status, '')}[{d.status.upper():^7}]{reset} {r.site}  {r.url}  {status} {timing}")
@@ -140,7 +140,7 @@ def cmd_check(args: argparse.Namespace) -> int:
             "vps": cycle.reach.to_dict() if cycle.reach else None,
             "vps_stats": cycle.stats.to_dict() if cycle.stats else None,
             "vps_warnings": [w.__dict__ for w in cycle.vps_warnings],
-            "sites": [{"result": r.to_dict(), "diagnosis": d.to_dict()} for r, d in zip(cycle.results, cycle.diagnoses)],
+            "sites": [{"result": r.to_dict(), "diagnosis": d.to_dict()} for r, d in zip(cycle.results, cycle.diagnoses, strict=True)],
         }
         print(json.dumps(out, indent=2, default=str))
     else:

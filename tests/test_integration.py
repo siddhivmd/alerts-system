@@ -9,8 +9,8 @@ from conftest import healthy_stats, ok_result, reach
 from sitemonitor import runner as runner_mod
 from sitemonitor.alerts import AlertEvent, Notifier
 from sitemonitor.config import AlertsConfig, ConfigError, load_config
-from sitemonitor.diagnosis import Warn
 from sitemonitor.dashboard import create_app
+from sitemonitor.diagnosis import Warn
 from sitemonitor.runner import Monitor
 from sitemonitor.storage import Storage
 

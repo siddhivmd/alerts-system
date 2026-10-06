@@ -1,2 +1,3 @@
 -r requirements.txt
-pytest>=8.0
+pytest==9.1.1          # same versions as CI (.github/workflows/ci.yml)
+ruff==0.16.10

@@ -196,6 +196,9 @@ class DashboardConfig:
     port: int = 8080
     username: str = "admin"
     password: str | None = None
+    max_login_failures: int = 5  # wrong passwords from one IP within lockout_minutes -> that IP is locked out
+    lockout_minutes: int = 15
+    trust_proxy: bool = False  # behind Caddy/nginx: take the client IP from X-Forwarded-For
 
 
 @dataclass
@@ -267,6 +270,9 @@ class SecurityConfig:
     extra_ips: list[str] = field(default_factory=list)  # other IPs to check, e.g. a mail server
     # Google Safe Browsing - needs GOOGLE_SAFE_BROWSING_KEY in .env.
     safe_browsing: bool = False
+    # web_risk: Google Web Risk API (commercial use; key GOOGLE_WEB_RISK_KEY).
+    # safe_browsing: free Safe Browsing API, NON-commercial use only (key GOOGLE_SAFE_BROWSING_KEY).
+    safe_browsing_provider: str = "web_risk"
     safe_browsing_interval_minutes: int = 60
     safe_browsing_key: str | None = None
     # Over SSH (only when vps.ssh is configured).
@@ -614,6 +620,13 @@ def load_config(path: str | os.PathLike[str] = "config.yaml", env_file: str | No
         warnings.append(f"Dashboard has no DASHBOARD_PASSWORD: serving without login on 127.0.0.1 only "
                         f"(not {dashboard.host})")
         dashboard.host = "127.0.0.1"
+    elif dashboard.enabled and dashboard.password and dashboard.host not in ("127.0.0.1", "localhost", "::1") \
+            and not dashboard.trust_proxy:
+        warnings.append(f"Dashboard listens on {dashboard.host}:{dashboard.port} over plain HTTP: the password "
+                        "is sent unencrypted. Put Caddy (HTTPS) in front and set dashboard.host: 127.0.0.1 "
+                        "and trust_proxy: true (see README)")
+    if dashboard.max_login_failures < 1 or dashboard.lockout_minutes < 1:
+        raise ConfigError("dashboard.max_login_failures and lockout_minutes must be >= 1")
 
     # --- sites
     defaults = _section(raw, "defaults")
@@ -685,10 +698,14 @@ def load_config(path: str | os.PathLike[str] = "config.yaml", env_file: str | No
     security = SecurityConfig(**_pick(sec_raw, SecurityConfig, "security"))
     for name in ("blacklists", "extra_ips", "known_processes", "web_roots", "php_watch_ignore"):
         setattr(security, name, [str(v).strip() for v in _as_list(getattr(security, name)) if str(v).strip()])
+    security.safe_browsing_provider = security.safe_browsing_provider.strip().lower()
+    if security.safe_browsing_provider not in ("web_risk", "safe_browsing"):
+        raise ConfigError("security.safe_browsing_provider must be web_risk or safe_browsing")
     if security.enabled and security.safe_browsing:
-        security.safe_browsing_key = _env("GOOGLE_SAFE_BROWSING_KEY")
+        key_name = "GOOGLE_WEB_RISK_KEY" if security.safe_browsing_provider == "web_risk" else "GOOGLE_SAFE_BROWSING_KEY"
+        security.safe_browsing_key = _env(key_name)
         if not security.safe_browsing_key:
-            warnings.append("Google Safe Browsing off: missing GOOGLE_SAFE_BROWSING_KEY in .env")
+            warnings.append(f"Google malware/phishing check off: missing {key_name} in .env")
 
     # --- watchdog heartbeat
     heartbeat = HeartbeatConfig(**_pick(_section(raw, "heartbeat"), HeartbeatConfig, "heartbeat"))

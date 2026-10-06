@@ -1,9 +1,13 @@
+# Direct dependencies (version ranges). For reproducible installs use requirements.lock,
+# which pins every package exactly; regenerate it after changing this file (see README).
 requests>=2.31
 paramiko>=3.4
+cryptography>=42        # used directly in checks.py (reading invalid SSL certificates)
 PyYAML>=6.0
 python-dotenv>=1.0
 APScheduler>=3.10,<4
 Flask>=3.0
+Jinja2>=3.1             # used directly for the monthly report emails
 python-whois>=0.9
 waitress>=3.0
 tzdata>=2024.1

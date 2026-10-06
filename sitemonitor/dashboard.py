@@ -17,9 +17,12 @@ from __future__ import annotations
 
 import hmac
 import logging
+import threading
 import time
+from collections import deque
+from collections.abc import Callable
 from functools import wraps
-from typing import Any, Callable
+from typing import Any
 
 from flask import Flask, Response, abort, jsonify, render_template, request
 
@@ -32,9 +35,74 @@ log = logging.getLogger(__name__)
 _STATUS_ORDER = {"down": 0, "warning": 1, "up": 2, None: 3}
 
 
-def _requires_auth(cfg: Config) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+class BadParam(ValueError):
+    """A query parameter is not a valid number: answer 400, not 500."""
+
+
+def int_arg(name: str, default: int, lo: int, hi: int) -> int:
+    raw = request.args.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise BadParam(f"'{name}' must be a whole number between {lo} and {hi}") from None
+    return max(lo, min(value, hi))
+
+
+class LoginGuard:
+    """Lock an IP out after too many wrong passwords (brute-force protection). Memory only, thread-safe."""
+
+    def __init__(self, max_failures: int, lockout_seconds: float, clock: Callable[[], float] = time.time) -> None:
+        self.max_failures, self.lockout, self.clock = max_failures, lockout_seconds, clock
+        self._failures: dict[str, deque[float]] = {}
+        self._locked_until: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def retry_after(self, ip: str) -> int:
+        """Seconds until ``ip`` may try again (0 = not locked)."""
+        with self._lock:
+            until = self._locked_until.get(ip, 0)
+            remaining = until - self.clock()
+            if remaining <= 0:
+                self._locked_until.pop(ip, None)
+                return 0
+            return int(remaining) + 1
+
+    def failed(self, ip: str) -> None:
+        now = self.clock()
+        with self._lock:
+            q = self._failures.setdefault(ip, deque())
+            q.append(now)
+            while q and now - q[0] > self.lockout:
+                q.popleft()
+            if len(q) >= self.max_failures:
+                self._locked_until[ip] = now + self.lockout
+                q.clear()
+                log.warning("Dashboard: %s locked out for %d min after %d wrong passwords",
+                            ip, self.lockout // 60, self.max_failures)
+            if len(self._failures) > 10_000:  # bound memory under a distributed attack
+                self._failures.clear()
+
+    def succeeded(self, ip: str) -> None:
+        with self._lock:
+            self._failures.pop(ip, None)
+
+
+def client_ip(trust_proxy: bool) -> str:
+    """The real client address. Behind ONE reverse proxy: the right-most X-Forwarded-For entry, which that
+    proxy added itself. (Entries to its left come from the client and can be forged to dodge the lockout.)"""
+    if trust_proxy:
+        forwarded = request.headers.get("X-Forwarded-For", "")
+        if forwarded:
+            return forwarded.split(",")[-1].strip()
+    return request.remote_addr or "unknown"
+
+
+def _requires_auth(cfg: Config, guard: LoginGuard | None = None) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     user = cfg.dashboard.username
     password = cfg.dashboard.password or ""
+    guard = guard or LoginGuard(cfg.dashboard.max_login_failures, cfg.dashboard.lockout_minutes * 60)
 
     def decorator(view: Callable[..., Any]) -> Callable[..., Any]:
         if not password:
@@ -43,13 +111,22 @@ def _requires_auth(cfg: Config) -> Callable[[Callable[..., Any]], Callable[..., 
 
         @wraps(view)
         def wrapped(*args: Any, **kwargs: Any) -> Any:
+            ip = client_ip(cfg.dashboard.trust_proxy)
+            wait = guard.retry_after(ip)
+            if wait:  # locked: even the right password is refused, so guessing cannot continue
+                return Response(f"Too many failed logins. Try again in {wait // 60 + 1} minute(s).", 429,
+                                {"Retry-After": str(wait)})
             auth = request.authorization
-            ok = bool(auth and auth.username is not None and auth.password is not None
-                      and hmac.compare_digest(auth.username.encode(), user.encode())
-                      and hmac.compare_digest(auth.password.encode(), password.encode()))
-            if not ok:
+            if auth is None or auth.password is None:  # browser's first request, before the prompt
                 return Response("Authentication required", 401,
                                 {"WWW-Authenticate": 'Basic realm="Site Monitor", charset="UTF-8"'})
+            ok = (hmac.compare_digest((auth.username or "").encode(), user.encode())
+                  and hmac.compare_digest(auth.password.encode(), password.encode()))
+            if not ok:
+                guard.failed(ip)
+                return Response("Authentication required", 401,
+                                {"WWW-Authenticate": 'Basic realm="Site Monitor", charset="UTF-8"'})
+            guard.succeeded(ip)
             return view(*args, **kwargs)
         return wrapped
     return decorator
@@ -111,10 +188,10 @@ def build_status(cfg: Config, storage: Storage) -> dict[str, Any]:
 
 
 def create_app(cfg: Config, storage: Storage, last_cycle: Callable[[], float | None] | None = None,
-               last_problems: Callable[[], list[str]] | None = None) -> Flask:
+               last_problems: Callable[[], list[str]] | None = None, guard: LoginGuard | None = None) -> Flask:
     app = Flask(__name__)
     app.config["JSON_SORT_KEYS"] = False
-    auth = _requires_auth(cfg)
+    auth = _requires_auth(cfg, guard)
     fmt = Formatter(cfg.general.timezone)
     app.jinja_env.filters["when"] = fmt.when
     app.jinja_env.filters["duration"] = lambda v: "-" if v is None else format_duration(v)
@@ -163,6 +240,10 @@ def create_app(cfg: Config, storage: Storage, last_cycle: Callable[[], float | N
             return _status_response(client_id[:-5], True)
         return _status_response(client_id, False)
 
+    @app.errorhandler(BadParam)
+    def _bad_param(exc: BadParam) -> tuple[Response, int]:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
     @app.after_request
     def _headers(resp: Response) -> Response:
         resp.headers.setdefault("X-Content-Type-Options", "nosniff")
@@ -187,7 +268,7 @@ def create_app(cfg: Config, storage: Storage, last_cycle: Callable[[], float | N
     @dashboard_only
     @auth
     def api_history() -> Response:
-        hours = max(1, min(int(request.args.get("hours", 24)), 24 * 90))
+        hours = int_arg("hours", 24, 1, 24 * 90)
         since = time.time() - hours * 3600
         series: dict[str, list[list[Any]]] = {}
         configured = {s.name for s in cfg.sites}
@@ -200,7 +281,7 @@ def create_app(cfg: Config, storage: Storage, last_cycle: Callable[[], float | N
     @dashboard_only
     @auth
     def api_incidents() -> Response:
-        limit = max(1, min(int(request.args.get("limit", 50)), 500))
+        limit = int_arg("limit", 50, 1, 500)
         keys = ("id", "site_name", "url", "started_at", "ended_at", "cause_code", "cause",
                 "acknowledged_at", "acknowledged_by")
         rows = [{k: i.get(k) for k in keys} for i in storage.incidents(limit=limit)]
@@ -229,7 +310,7 @@ def create_app(cfg: Config, storage: Storage, last_cycle: Callable[[], float | N
     @dashboard_only
     @auth
     def api_reliability() -> Response:
-        days = max(1, min(int(request.args.get("days", 30)), 90))
+        days = int_arg("days", 30, 1, 90)
         now = time.time()
         return jsonify({"days": days, **sla.reliability(sla.compute(cfg, storage, now - days * 86400, now, now))})
 

@@ -1,0 +1,21 @@
+# HTTPS front door for the monitor dashboard (Caddy gets and renews the certificate itself).
+#
+# Docker:  used by the "caddy" service in docker-compose.yml (MONITOR_DOMAIN from .env).
+# systemd: install Caddy on the host, copy this file to /etc/caddy/Caddyfile, replace
+#          {$MONITOR_DOMAIN} with your domain and "monitor:8080" with "127.0.0.1:8080".
+#
+# In config.yaml set:  dashboard: {trust_proxy: true}   (and host: 127.0.0.1 when not using Docker)
+
+{$MONITOR_DOMAIN} {
+	encode gzip
+	reverse_proxy monitor:8080
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+	}
+}
+
+# Public status page on a client's own name (set clients.<id>.status_domain to the same name):
+# status.clientname.com {
+# 	reverse_proxy monitor:8080
+# }

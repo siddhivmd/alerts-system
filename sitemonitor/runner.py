@@ -23,9 +23,9 @@ from .config import Config, SiteConfig
 from .diagnosis import DOWN, UP, WARNING, Diagnosis, Warn, diagnose, is_failing, vps_warnings
 from .heartbeat import Heartbeat
 from .security import EXTRA_KEY, SecurityChecker
-from .trends import disk_forecast_warning
 from .ssh_stats import VpsStats, collect_stats, fetch_error_logs
 from .storage import Storage
+from .trends import disk_forecast_warning
 
 log = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -262,7 +262,7 @@ class Monitor:
                        diagnoses: list[Diagnosis], save: bool) -> None:
         """Defacement detection on every page that loaded fine. Never raises."""
         by_name = {s.name: s for s in sites}
-        for r, d in zip(results, diagnoses):
+        for r, d in zip(results, diagnoses, strict=True):
             site = by_name.get(r.site)
             if site is None or d.status == DOWN:
                 continue
@@ -310,7 +310,7 @@ class Monitor:
     def _save(self, cycle: CycleResult) -> None:
         try:
             rows = []
-            for r, d in zip(cycle.results, cycle.diagnoses):
+            for r, d in zip(cycle.results, cycle.diagnoses, strict=True):
                 site_id = self.site_ids.get(r.site)
                 if site_id is None:
                     continue

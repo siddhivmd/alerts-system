@@ -17,14 +17,15 @@ from __future__ import annotations
 
 import fnmatch
 import ipaddress
-from collections import defaultdict
 import logging
 import socket
 import time
+from collections import defaultdict
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 from urllib.parse import urlparse
 
 import requests
@@ -44,7 +45,8 @@ BLACKLIST_INFO = {
     "b.barracudacentral.org": ("Barracuda", "https://www.barracudacentral.org/lookups"),
 }
 
-SAFE_BROWSING_URL = "https://safebrowsing.googleapis.com/v4/threatMatches:find"
+SAFE_BROWSING_URL = "https://safebrowsing.googleapis.com/v4/threatMatches:find"  # free, non-commercial
+WEB_RISK_URL = "https://webrisk.googleapis.com/v1/uris:search"  # commercial equivalent
 THREAT_LABELS = {
     "MALWARE": "malware",
     "SOCIAL_ENGINEERING": "phishing / deceptive site",
@@ -191,6 +193,29 @@ def check_safe_browsing(urls: list[str], api_key: str, post: Callable[..., Any] 
     return flagged, None
 
 
+def check_web_risk(urls: list[str], api_key: str, get: Callable[..., Any] = requests.get,
+                   timeout: float = 15.0) -> tuple[dict[str, list[str]], str | None]:
+    """Google Web Risk (commercial). One request per URL; same result shape as check_safe_browsing."""
+    flagged: dict[str, list[str]] = {}
+    errors = []
+    for url in urls:
+        try:
+            resp = get(WEB_RISK_URL, params=[("uri", url), ("key", api_key)] +
+                       [("threatTypes", t) for t in ("MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE")],
+                       timeout=timeout)
+            if resp.status_code != 200:
+                errors.append(f"HTTP {resp.status_code}: {resp.text[:150]}")
+                continue
+            threats = ((resp.json() or {}).get("threat") or {}).get("threatTypes") or []
+            if threats:
+                flagged[url] = list(threats)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(str(exc).replace(api_key, "***") or type(exc).__name__)
+    if errors and len(errors) == len(urls):  # nothing could be checked: report it, keep earlier flags
+        return {}, f"Web Risk lookup failed: {errors[0]}"
+    return flagged, None
+
+
 def safe_browsing_warning(threats: list[str]) -> Warn:
     labels = ", ".join(THREAT_LABELS.get(t, t.lower()) for t in threats)
     return Warn("safe_browsing", f"Google Safe Browsing flags this site as {labels}: "
@@ -291,11 +316,12 @@ class SecurityChecker:
     """
 
     def __init__(self, cfg: Config, resolve: Callable[[str], str] = socket.gethostbyname,
-                 post: Callable[..., Any] = requests.post) -> None:
+                 post: Callable[..., Any] = requests.post, get: Callable[..., Any] = requests.get) -> None:
         self.cfg = cfg
         self.sec = cfg.security
         self._resolve = resolve
         self._post = post
+        self._get = get
         self._blacklist_at: float | None = None  # None = never run yet
         self.blacklist_results: list[BlacklistResult] = []
         self._sb_at: float | None = None
@@ -349,8 +375,11 @@ class SecurityChecker:
                 log.exception("Blacklist check failed")
         if self.sec.safe_browsing_key and self._due(self._sb_at, now, self.sec.safe_browsing_interval_minutes):
             self._sb_at = now
-            flags, error = check_safe_browsing([s.url for s in self.cfg.sites], self.sec.safe_browsing_key,
-                                               self._post)
+            urls = [s.url for s in self.cfg.sites]
+            if self.sec.safe_browsing_provider == "web_risk":
+                flags, error = check_web_risk(urls, self.sec.safe_browsing_key, self._get)
+            else:
+                flags, error = check_safe_browsing(urls, self.sec.safe_browsing_key, self._post)
             self.safe_browsing_error = error
             if error:
                 log.warning("%s", error)  # keep previous flags rather than forgetting them on an API hiccup
@@ -375,8 +404,9 @@ class SecurityChecker:
         sb = None
         if self.sec.safe_browsing_key:
             flagged = len(self.safe_browsing_flags)
+            source = "Web Risk" if self.sec.safe_browsing_provider == "web_risk" else "Safe Browsing"
             sb = self.safe_browsing_error or (
-                f"{flagged} site(s) flagged" if flagged else f"no site flagged ({len(self.cfg.sites)} checked)")
+                f"{flagged} site(s) flagged" if flagged else f"no site flagged ({len(self.cfg.sites)} checked, {source})")
         return {
             "enabled": self.sec.enabled,
             "blacklists": [r.summary() for r in self.blacklist_results],

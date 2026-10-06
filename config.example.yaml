@@ -105,7 +105,9 @@ security:
   blacklist_interval_minutes: 60
   blacklists: [zen.spamhaus.org, bl.spamcop.net, psbl.surriel.com, dnsbl-1.uceprotect.net]
   extra_ips: []                  # other IPs to check too, e.g. a separate mail server
-  safe_browsing: false           # Google flags a site as malware/phishing; key: GOOGLE_SAFE_BROWSING_KEY in .env
+  safe_browsing: false           # Google flags a site as malware/phishing (key in .env, see provider)
+  safe_browsing_provider: web_risk   # web_risk = commercial use (GOOGLE_WEB_RISK_KEY);
+                                     # safe_browsing = free API, NON-commercial only (GOOGLE_SAFE_BROWSING_KEY)
   safe_browsing_interval_minutes: 60
   # The checks below run over SSH, so they need vps.ssh:
   cpu_process_percent: 80        # an unknown process above this % CPU is reported
@@ -127,6 +129,9 @@ dashboard:
   port: 8080
   username: admin                # password: DASHBOARD_PASSWORD in .env.
                                  # Without it the dashboard still runs, with no login, on 127.0.0.1 only.
+  max_login_failures: 5          # wrong passwords from one IP ...
+  lockout_minutes: 15            # ... within this time lock that IP out for this long
+  trust_proxy: false             # true ONLY behind Caddy/nginx (HTTPS): client IP from X-Forwarded-For
 
 # Monthly SLA report per client (+ an internal reliability report for you), on `day` at `time`.
 monthly_report:

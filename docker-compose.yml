@@ -10,7 +10,9 @@ services:
     environment:
       TZ: ${TZ:-UTC}
     ports:
-      - "8080:8080"                     # put a reverse proxy with HTTPS in front for internet access
+      # Only reachable from THIS machine. From the internet, go through Caddy (HTTPS) below,
+      # or use an SSH tunnel: ssh -L 8080:127.0.0.1:8080 you@monitor-host
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./ssh:/app/ssh:ro               # SSH private key; set vps.ssh.key_file: ssh/monitor_ed25519
@@ -19,3 +21,29 @@ services:
     logging:
       driver: json-file
       options: {max-size: "10m", max-file: "3"}
+
+  # Optional HTTPS front door with automatic Let's Encrypt certificates:
+  #   1. point a DNS name (e.g. monitor.yourcompany.com) at this server
+  #   2. put MONITOR_DOMAIN=monitor.yourcompany.com in .env
+  #   3. in config.yaml: dashboard: {host: 0.0.0.0, trust_proxy: true}
+  #   4. docker compose --profile https up -d
+  caddy:
+    image: caddy:2
+    profiles: ["https"]
+    container_name: site-monitor-caddy
+    restart: unless-stopped
+    environment:
+      MONITOR_DOMAIN: ${MONITOR_DOMAIN:-}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data                # certificates
+      - caddy_config:/config
+    depends_on:
+      - monitor
+
+volumes:
+  caddy_data: {}
+  caddy_config: {}

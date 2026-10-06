@@ -3,10 +3,25 @@ import socket
 
 from conftest import healthy_stats
 
-from sitemonitor.config import (AlertsConfig, Config, DailyReportConfig, DashboardConfig, GeneralConfig,
-                                SecurityConfig, SiteConfig, Thresholds, VpsConfig)
-from sitemonitor.security import (SecurityChecker, blacklist_warnings, check_blacklists, check_safe_browsing,
-                                  dnsbl_query_name, server_security_warnings)
+from sitemonitor.config import (
+    AlertsConfig,
+    Config,
+    DailyReportConfig,
+    DashboardConfig,
+    GeneralConfig,
+    SecurityConfig,
+    SiteConfig,
+    Thresholds,
+    VpsConfig,
+)
+from sitemonitor.security import (
+    SecurityChecker,
+    blacklist_warnings,
+    check_blacklists,
+    check_safe_browsing,
+    dnsbl_query_name,
+    server_security_warnings,
+)
 from sitemonitor.ssh_stats import parse_stats
 
 ZONES = ["zen.spamhaus.org", "bl.spamcop.net", "psbl.surriel.com"]
@@ -198,6 +213,7 @@ def test_parse_without_security_sections_leaves_defaults():
 
 # ---------------------------------------------------------------- scheduling / caching
 def make_config(**security):
+    security.setdefault("safe_browsing_provider", "safe_browsing")  # these tests fake the free API
     return Config(general=GeneralConfig(), thresholds=Thresholds(), alerts=AlertsConfig(),
                   daily_report=DailyReportConfig(), dashboard=DashboardConfig(),
                   sites=[SiteConfig(name="Shop", url="https://shop.test/")],
@@ -230,6 +246,28 @@ def test_checker_extra_ips_and_safe_browsing_site_warnings():
     [w] = checker.site_warnings()["Shop"]
     assert w.code == "safe_browsing" and "malware" in w.message
     assert checker.summary()["safe_browsing"] == "1 site(s) flagged"
+
+
+def test_web_risk_provider():
+    calls = []
+
+    def get(url, params, timeout):
+        calls.append(dict(params) | {"_url": url, "_types": [v for k, v in params if k == "threatTypes"]})
+        uri = dict(params)["uri"]
+        return FakeResponse(200, {"threat": {"threatTypes": ["MALWARE"]}} if "bad" in uri else {})
+
+    from sitemonitor.security import check_web_risk
+    flags, err = check_web_risk(["https://bad.test/", "https://good.test/"], "KEY", get)
+    assert err is None and flags == {"https://bad.test/": ["MALWARE"]}
+    assert calls[0]["_url"].startswith("https://webrisk.googleapis.com/") and "SOCIAL_ENGINEERING" in calls[0]["_types"]
+    flags, err = check_web_risk(["https://a.test/"], "SECRETKEY", lambda *a, **k: FakeResponse(403, "denied"))
+    assert flags == {} and "403" in err and "SECRETKEY" not in err
+    cfg = make_config(blacklist_check=False, safe_browsing=True, safe_browsing_key="K", safe_browsing_provider="web_risk")
+    checker = SecurityChecker(cfg, fake_resolver({}), get=lambda url, params, timeout: FakeResponse(
+        200, {"threat": {"threatTypes": ["SOCIAL_ENGINEERING"]}}))
+    checker.refresh(now=1.0)
+    assert "phishing" in checker.site_warnings()["Shop"][0].message
+    assert "Web Risk" not in checker.summary()["safe_browsing"]  # flagged -> count, not provider name
 
 
 def test_safe_browsing_api_error_keeps_previous_flags():

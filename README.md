@@ -142,7 +142,7 @@ Hosts suspend accounts for "malicious activity", meaning the server was sending 
 | Check | Needs | Raises a warning when |
 |---|---|---|
 | **Spam blacklists** (Spamhaus, SpamCop, PSBL, UCEPROTECT) | Nothing; this is a DNS lookup of the VPS IP | The IP is listed. Critical: a listing usually means the server is sending spam |
-| **Google Safe Browsing** | Free API key in `.env` + `security.safe_browsing: true` | Google flags a site as malware or phishing. Chrome then shows visitors a red warning page |
+| **Google malware/phishing check** | `security.safe_browsing: true` and an API key in `.env` (see the note below) | Google flags a site as malware or phishing. Chrome then shows visitors a red warning page |
 | **Crypto-miners** | `vps.ssh` | A process matches known miner names or mining-pool addresses (`stratum+tcp://`) |
 | **Programs running from temp folders** | `vps.ssh` | A process runs from `/tmp`, `/var/tmp` or `/dev/shm`, a classic malware location |
 | **Unknown high-CPU processes** | `vps.ssh` | A process that isn't in `known_processes` uses more than 80% CPU |
@@ -156,7 +156,7 @@ The blacklist and Safe Browsing lookups are rate-limited, so they run once an ho
 
 Notes:
 - **Spamhaus refuses lookups that come through big public DNS servers** such as 8.8.8.8 or 1.1.1.1. The monitor then shows "refused the query" for Spamhaus, which is not the same as being listed. The fix is to use your hosting provider's DNS server, or a free Spamhaus DQS key.
-- **The free Safe Browsing API is for non-commercial use** under Google's terms. For company use, Google's paid Web Risk API is the equivalent.
+- **Which Google API to use.** The default is `security.safe_browsing_provider: web_risk`, **Google Web Risk**, which is licensed for commercial use. Enable "Web Risk API" in a Google Cloud project and put the key in `.env` as `GOOGLE_WEB_RISK_KEY`. It has a free monthly quota and is paid beyond that, so check Google's current pricing. With hourly checks of a few dozen sites, usage stays small. The free **Safe Browsing API** (`safe_browsing_provider: safe_browsing`, key `GOOGLE_SAFE_BROWSING_KEY`) is still supported, but Google's terms allow it for **non-commercial use only**.
 - **Deploying code triggers the new-PHP-file warning.** That's expected. Add folders you change often to `php_watch_ignore`.
 - **Permissions:** the `monitor` user needs the `systemd-journal` group (already in the SSH setup below) to read SSH logins. It needs read access to the web folders to find new PHP files.
 
@@ -207,7 +207,7 @@ Requires Python 3.10+.
 ```bash
 git clone <this repo> site-monitor && cd site-monitor
 python -m venv .venv && . .venv/bin/activate      # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+pip install -r requirements.lock                  # exact, tested versions (requirements.txt = ranges)
 
 cp config.example.yaml config.yaml                # edit: VPS IP, sites, recipients
 cp .env.example .env                              # fill in the secrets
@@ -329,7 +329,23 @@ sudo chown -R monitor:monitor /home/monitor/.ssh && sudo chmod 700 /home/monitor
 | `/api/incidents?limit=50` | yes | Past and ongoing outages |
 | `/healthz` | no | `{"ok": true}` while check cycles are running on schedule. Returns 503 if the scheduler stalls |
 
-Basic auth sends the password with every request. Before exposing the dashboard to the internet, put it behind HTTPS (Caddy or nginx with Let's Encrypt), or restrict port 8080 to your office IP / VPN.
+Bad parameters such as `?hours=abc` return a clear **400** error. Values out of range are clamped.
+
+### Exposing it safely (HTTPS + lockout)
+
+The dashboard uses HTTP Basic auth, so **the password travels with every request**. Over plain HTTP, anyone on the network path can read it. Don't open port 8080 to the internet.
+
+- **Docker** publishes the port on `127.0.0.1` only. From elsewhere, either use an SSH tunnel (`ssh -L 8080:127.0.0.1:8080 you@monitor-host`, then open http://127.0.0.1:8080), or turn on the **Caddy HTTPS front door**:
+  1. Point a DNS name, e.g. `monitor.yourcompany.com`, at the server.
+  2. Put `MONITOR_DOMAIN=monitor.yourcompany.com` in `.env`.
+  3. In `config.yaml`, set `dashboard: {host: 0.0.0.0, trust_proxy: true}`.
+  4. Run `docker compose --profile https up -d`.
+
+  Caddy fetches and renews the Let's Encrypt certificate automatically (see `deploy/Caddyfile`).
+- **systemd:** set `dashboard: {host: 127.0.0.1, trust_proxy: true}`, install Caddy on the server, and use `deploy/Caddyfile` with `reverse_proxy 127.0.0.1:8080`.
+- **Lockout:** after `max_login_failures` (5) wrong passwords from one IP within `lockout_minutes` (15), that IP gets **429 Too Many Requests** for 15 minutes, even with the right password, so guessing can't continue. A successful login resets the count.
+- **`trust_proxy: true`** only when a proxy is in front. The lockout then uses the client IP the proxy reports. Without a proxy, a client could fake that header.
+- The monitor **warns at startup** whenever the dashboard listens on a public interface over plain HTTP.
 
 ## Deployment
 
@@ -338,7 +354,7 @@ Basic auth sends the password with every request. Before exposing the dashboard 
 ```bash
 sudo useradd --system --home /opt/site-monitor --shell /usr/sbin/nologin sitemonitor
 sudo git clone <this repo> /opt/site-monitor && cd /opt/site-monitor
-sudo python3 -m venv .venv && sudo .venv/bin/pip install -r requirements.txt
+sudo python3 -m venv .venv && sudo .venv/bin/pip install -r requirements.lock
 sudo cp config.example.yaml config.yaml && sudo cp .env.example .env    # edit both
 sudo mkdir -p data logs ssh && sudo cp ~/.ssh/monitor_ed25519 ssh/      # key_file: ssh/monitor_ed25519
 sudo chown -R sitemonitor:sitemonitor /opt/site-monitor && sudo chmod 600 .env ssh/*
@@ -372,11 +388,21 @@ The container runs as a non-root user. History and logs persist in `./data` and 
 - Full diagnostic detail is stored only for failed or warned checks, which keeps the database small.
 - Logs go to `logs/monitor.log`, rotated at 5 MB with 5 files kept, and also to stdout/journald.
 
-## Tests
+## Tests, lint and CI
 
 ```bash
-pip install -r requirements-dev.txt
-python -m pytest
+pip install -r requirements.lock -r requirements-dev.txt
+ruff check .          # lint: pyflakes, pycodestyle, import order, bugbear, pyupgrade (pyproject.toml)
+python -m pytest      # the whole suite, offline
+```
+
+**CI:** `.github/workflows/ci.yml` runs `ruff check` and `pytest` on every push and pull request, on Python 3.12 (the Docker image) and 3.13. It installs the exact versions from `requirements.lock`, so CI tests what you deploy.
+
+**Dependencies:** `requirements.txt` lists what the code imports, with version ranges. `cryptography` and `Jinja2` are listed explicitly because the code uses them directly. `requirements.lock` pins **every** package, including indirect ones, to the exact version that passed the tests. The Dockerfile, the systemd steps and CI all install from the lock. After changing `requirements.txt`, regenerate the lock in a fresh virtualenv:
+
+```bash
+python -m venv .lockenv && .lockenv/bin/pip install -r requirements.txt
+.lockenv/bin/pip freeze > requirements.lock     # keep the comment header, then run the tests
 ```
 
 | Test file | Covers |
@@ -386,6 +412,8 @@ python -m pytest
 | `tests/test_security.py` | Blacklist answers, including Spamhaus refusing a public resolver and ISP DNS hijacking; Safe Browsing matches and errors; miner, temp-folder and PHP-file detection; SSH brute force; outbound spam; caching. All offline |
 | `tests/test_storage.py`, `tests/test_ssh_stats.py` | The database layer, and the remote-output parser run on realistic sample output |
 | `tests/test_integration.py` | Config validation, a full cycle with mocked network calls (one crashing check must not stop the others), and dashboard auth / API |
+| `tests/test_hardening.py` | Login lockout (including forged `X-Forwarded-For`), 400 on bad parameters, parallel port checks, the plain-HTTP warning |
+| `tests/test_sla.py`, `tests/test_new_checks.py`, `tests/test_features.py` | SLA reports, status pages, acknowledgement, multiple servers, inodes, disk trend, DNS hijack, RDAP, flapping, login checks, WhatsApp, escalation, maintenance, defacement, backups |
 
 ## Project layout
 

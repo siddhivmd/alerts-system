@@ -9,7 +9,8 @@ you hear about it immediately instead of after the grace period.
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import requests
 

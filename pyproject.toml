@@ -1,0 +1,19 @@
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = ["data", "logs"]
+
+[tool.ruff.lint]
+# pyflakes (F), pycodestyle errors/warnings (E, W), import order (I), bugbear (B), pyupgrade (UP)
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = [
+    "E501",  # long lines: mostly user-facing messages and embedded shell commands; aim for 120
+    "E731",  # small lambdas assigned to names are fine
+    "B008",  # function calls in defaults (dataclass field factories)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

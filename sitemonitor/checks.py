@@ -13,9 +13,10 @@ import socket
 import ssl
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any
 
 import requests
 
@@ -525,7 +526,7 @@ def check_internet(hosts: list[str], timeout: float = 4.0,
                 return True, {futures[fut]: "ok"}
             errors[futures[fut]] = error
     except FutureTimeout:
-        for fut, host in futures.items():
+        for host in futures.values():
             errors.setdefault(host, f"no answer within {timeout:.0f}s")
     finally:
         ex.shutdown(wait=False, cancel_futures=True)
@@ -534,13 +535,24 @@ def check_internet(hosts: list[str], timeout: float = 4.0,
 
 def check_vps_ports(vps: VpsConfig, connect: Callable[..., socket.socket] = socket.create_connection
                     ) -> VpsReachability:
-    """TCP-connect to each configured port. All closed => VPS down or suspended."""
-    out = VpsReachability(host=vps.host)
-    for port in vps.ports:
+    """TCP-connect to every configured port IN PARALLEL. All closed => VPS down or suspended.
+
+    In parallel, a dead server costs one timeout (8 s), not one per port (24 s).
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    def attempt(port: int) -> str | None:
         try:
             connect((vps.host, port), timeout=vps.port_timeout).close()
-            out.ports[port] = True
+            return None
         except OSError as exc:
-            out.ports[port] = False
-            out.errors[port] = str(exc) or type(exc).__name__
+            return str(exc) or type(exc).__name__
+
+    out = VpsReachability(host=vps.host)
+    with ThreadPoolExecutor(max_workers=max(1, len(vps.ports)), thread_name_prefix="ports") as ex:
+        results = list(zip(vps.ports, ex.map(attempt, vps.ports), strict=True))
+    for port, error in results:  # keep the configured port order
+        out.ports[port] = error is None
+        if error is not None:
+            out.errors[port] = error
     return out
