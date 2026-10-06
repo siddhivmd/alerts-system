@@ -47,6 +47,8 @@ class SiteConfig:
     on_vps: bool = True  # hosted on the monitored VPS (enables VPS-based diagnosis)
     error_log: str | None = None  # per-site web server error log path on the VPS
     verify_ssl: bool = True
+    public_name: str | None = None  # name shown on the public status page (default: name)
+    content_change_alert: float = 70.0  # % of page words that must change suddenly -> defacement warning; 0 = off
 
     @property
     def hostname(self) -> str:
@@ -117,6 +119,33 @@ class TelegramConfig:
 
 
 @dataclass
+class WhatsAppConfig:
+    """WhatsApp via Twilio (easy sandbox for testing) or Meta's WhatsApp Cloud API."""
+
+    provider: str = "twilio"  # twilio | meta
+    to: list[str] = field(default_factory=list)  # numbers in international format, e.g. +919812345678
+    from_number: str | None = None  # twilio: your WhatsApp sender, e.g. +14155238886 (sandbox)
+    phone_number_id: str | None = None  # meta: the sender's phone number ID
+    template: str | None = None  # meta: approved template with one {{1}} text parameter
+    template_language: str = "en"
+    timeout: float = 15.0
+    account_sid: str | None = None  # twilio, from .env
+    auth_token: str | None = None  # twilio, from .env
+    access_token: str | None = None  # meta, from .env
+
+
+@dataclass
+class EscalationConfig:
+    """Alert extra people when an outage lasts too long (once per incident)."""
+
+    after_minutes: int = 30
+    email_to: list[str] = field(default_factory=list)
+    telegram_chat_ids: list[str] = field(default_factory=list)
+    whatsapp_to: list[str] = field(default_factory=list)
+    notify_recovery: bool = True  # also tell them when it is fixed
+
+
+@dataclass
 class AlertsConfig:
     consecutive_failures: int = 2
     throttle_minutes: int = 30
@@ -124,6 +153,8 @@ class AlertsConfig:
     console: bool = False  # also write alert messages to the log/console (handy for testing)
     email: EmailConfig | None = None
     telegram: TelegramConfig | None = None
+    whatsapp: WhatsAppConfig | None = None
+    escalation: EscalationConfig | None = None
 
 
 @dataclass
@@ -140,6 +171,46 @@ class DashboardConfig:
     port: int = 8080
     username: str = "admin"
     password: str | None = None
+
+
+@dataclass
+class HeartbeatConfig:
+    """Watchdog: ping an external service after every check cycle (e.g. healthchecks.io).
+    If the pings stop, that service alerts you - so a dead monitor is never silent."""
+
+    enabled: bool = False
+    url: str | None = None  # from .env HEARTBEAT_URL
+    timeout: float = 10.0
+    fail_suffix: str = "/fail"  # healthchecks.io and Better Stack accept <url>/fail; "" to never report failure
+
+
+@dataclass
+class MonthlyReportConfig:
+    enabled: bool = True
+    day: int = 1  # day of the month to send last month's report
+    time: str = "09:00"
+    channels: list[str] = field(default_factory=lambda: ["email"])
+
+
+@dataclass
+class StatusPageConfig:
+    """Public, read-only /status page for clients. Shows names and up/down only."""
+
+    enabled: bool = False
+    title: str = "Service status"
+    sites: list[str] = field(default_factory=list)  # site names to show; empty = all
+    show_incidents: bool = True
+    days: int = 30
+
+
+@dataclass
+class BackupsConfig:
+    """Over SSH: newest file matching each pattern must be recent and not tiny."""
+
+    enabled: bool = False
+    paths: list[str] = field(default_factory=list)  # glob patterns, e.g. /var/backups/db-*.sql.gz
+    max_age_hours: float = 26.0
+    min_size_mb: float = 1.0
 
 
 @dataclass
@@ -196,6 +267,10 @@ class Config:
     sites: list[SiteConfig]
     vps: VpsConfig | None = None
     security: SecurityConfig = field(default_factory=SecurityConfig)
+    heartbeat: HeartbeatConfig = field(default_factory=HeartbeatConfig)
+    monthly_report: MonthlyReportConfig = field(default_factory=MonthlyReportConfig)
+    status_page: StatusPageConfig = field(default_factory=StatusPageConfig)
+    backups: BackupsConfig = field(default_factory=BackupsConfig)
     base_dir: Path = Path(".")
     warnings: list[str] = field(default_factory=list)  # features switched off because of missing settings
 
@@ -203,6 +278,18 @@ class Config:
 # --------------------------------------------------------------------------- helpers
 
 _TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+_BACKUP_GLOB_RE = re.compile(r"^/[A-Za-z0-9_./*?-]+$")
+_PHONE_RE = re.compile(r"^\+?[0-9]{8,15}$")
+
+
+def _phone(value: Any) -> str:
+    """Normalise a phone number to +<digits>. Accepts spaces/dashes and an optional 'whatsapp:' prefix."""
+    raw = str(value).strip()
+    raw = raw[len("whatsapp:"):] if raw.lower().startswith("whatsapp:") else raw
+    digits = re.sub(r"[\s()-]", "", raw)
+    if not _PHONE_RE.match(digits):
+        raise ConfigError(f"Invalid phone number {value!r}: use international format, e.g. +919812345678")
+    return digits if digits.startswith("+") else "+" + digits
 
 
 def _section(raw: dict[str, Any], key: str) -> dict[str, Any]:
@@ -315,6 +402,8 @@ def load_config(path: str | os.PathLike[str] = "config.yaml", env_file: str | No
     alerts_raw = _section(raw, "alerts")
     email_raw = alerts_raw.pop("email", None) or {}
     tg_raw = alerts_raw.pop("telegram", None) or {}
+    wa_raw = alerts_raw.pop("whatsapp", None) or {}
+    esc_raw = alerts_raw.pop("escalation", None) or {}
     alerts = AlertsConfig(**_pick(alerts_raw, AlertsConfig, "alerts"))
     if alerts.consecutive_failures < 1:
         raise ConfigError("alerts.consecutive_failures must be >= 1")
@@ -349,14 +438,62 @@ def load_config(path: str | os.PathLike[str] = "config.yaml", env_file: str | No
             alerts.telegram = TelegramConfig(bot_token=token, chat_ids=chat_ids,
                                              timeout=float(tg_raw.get("timeout", 15)))
 
+    if wa_raw.get("enabled", False):
+        wa = WhatsAppConfig(**_pick({k: v for k, v in wa_raw.items() if k != "enabled"}, WhatsAppConfig,
+                                    "alerts.whatsapp"))
+        wa.provider = wa.provider.lower()
+        wa.to = [_phone(n) for n in _as_list(wa.to)]
+        if wa.provider not in ("twilio", "meta"):
+            raise ConfigError("alerts.whatsapp.provider must be twilio or meta")
+        for secret in ("account_sid", "auth_token", "access_token"):
+            if getattr(wa, secret):
+                raise ConfigError(f"Put alerts.whatsapp.{secret} in .env, not in config.yaml")
+        if wa.provider == "twilio":
+            wa.account_sid, wa.auth_token = _env("TWILIO_ACCOUNT_SID"), _env("TWILIO_AUTH_TOKEN")
+            wa.from_number = _phone(wa.from_number) if wa.from_number else None
+            needed = (("TWILIO_ACCOUNT_SID in .env", wa.account_sid), ("TWILIO_AUTH_TOKEN in .env", wa.auth_token),
+                      ("alerts.whatsapp.from_number", wa.from_number), ("alerts.whatsapp.to", wa.to))
+        else:
+            wa.access_token = _env("WHATSAPP_ACCESS_TOKEN")
+            needed = (("WHATSAPP_ACCESS_TOKEN in .env", wa.access_token),
+                      ("alerts.whatsapp.phone_number_id", wa.phone_number_id), ("alerts.whatsapp.to", wa.to))
+        missing = [name for name, ok in needed if not ok]
+        if missing:
+            warnings.append(f"WhatsApp alerts off: missing {', '.join(missing)}")
+        else:
+            alerts.whatsapp = wa
+
+    if esc_raw.get("enabled", False):
+        esc = EscalationConfig(**_pick({k: v for k, v in esc_raw.items() if k != "enabled"}, EscalationConfig,
+                                       "alerts.escalation"))
+        esc.email_to = [str(a) for a in _as_list(esc.email_to)]
+        esc.telegram_chat_ids = [str(c) for c in _as_list(esc.telegram_chat_ids)]
+        esc.whatsapp_to = [_phone(n) for n in _as_list(esc.whatsapp_to)]
+        if esc.after_minutes < 1:
+            raise ConfigError("alerts.escalation.after_minutes must be >= 1")
+        if not (esc.email_to or esc.telegram_chat_ids or esc.whatsapp_to):
+            warnings.append("Escalation off: add email_to, telegram_chat_ids or whatsapp_to")
+        else:
+            alerts.escalation = esc
+
     daily = DailyReportConfig(**_pick(_section(raw, "daily_report"), DailyReportConfig, "daily_report"))
     if not _TIME_RE.match(daily.time):
         raise ConfigError(f"daily_report.time must be HH:MM, got {daily.time!r}")
     daily.channels = [str(c).strip().lower() for c in _as_list(daily.channels)]
-    bad = [c for c in daily.channels if c not in ("email", "telegram", "console")]
+    bad = [c for c in daily.channels if c not in ("email", "telegram", "whatsapp", "console")]
     if bad:
-        raise ConfigError(f"daily_report.channels takes channel names (email, telegram, console), not {bad}. "
+        raise ConfigError(f"daily_report.channels takes channel names (email, telegram, whatsapp, console), "
+                          f"not {bad}. "
                           "Recipients go under alerts.email.to")
+
+    monthly = MonthlyReportConfig(**_pick(_section(raw, "monthly_report"), MonthlyReportConfig, "monthly_report"))
+    if not _TIME_RE.match(monthly.time):
+        raise ConfigError(f"monthly_report.time must be HH:MM, got {monthly.time!r}")
+    if not 1 <= monthly.day <= 28:
+        raise ConfigError("monthly_report.day must be between 1 and 28")
+    monthly.channels = [str(c).strip().lower() for c in _as_list(monthly.channels)]
+    if any(c not in ("email", "telegram", "whatsapp", "console") for c in monthly.channels):
+        raise ConfigError("monthly_report.channels takes channel names (email, telegram, whatsapp, console)")
 
     dashboard = DashboardConfig(**_pick(_section(raw, "dashboard"), DashboardConfig, "dashboard"))
     dashboard.password = _env("DASHBOARD_PASSWORD")
@@ -388,6 +525,43 @@ def load_config(path: str | os.PathLike[str] = "config.yaml", env_file: str | No
         if not security.safe_browsing_key:
             warnings.append("Google Safe Browsing off: missing GOOGLE_SAFE_BROWSING_KEY in .env")
 
+    # --- watchdog heartbeat
+    heartbeat = HeartbeatConfig(**_pick(_section(raw, "heartbeat"), HeartbeatConfig, "heartbeat"))
+    if heartbeat.url:
+        raise ConfigError("Put the heartbeat URL in .env as HEARTBEAT_URL, not in config.yaml")
+    if heartbeat.enabled:
+        heartbeat.url = _env("HEARTBEAT_URL")
+        if not heartbeat.url:
+            warnings.append("Watchdog heartbeat off: missing HEARTBEAT_URL in .env")
+            heartbeat.enabled = False
+        elif not heartbeat.url.startswith(("https://", "http://")):
+            raise ConfigError("HEARTBEAT_URL must start with https://")
+
+    # --- public status page
+    status_page = StatusPageConfig(**_pick(_section(raw, "status_page"), StatusPageConfig, "status_page"))
+    status_page.sites = [str(n) for n in _as_list(status_page.sites)]
+    unknown = [n for n in status_page.sites if n not in names]
+    if unknown:
+        raise ConfigError(f"status_page.sites: unknown site name(s): {', '.join(unknown)}")
+    if status_page.enabled and dashboard.host == "127.0.0.1" and not dashboard.password:
+        warnings.append("Status page is only reachable on this machine until DASHBOARD_PASSWORD is set "
+                        "(the web server then listens on dashboard.host)")
+
+    # --- backups (over SSH)
+    backups = BackupsConfig(**_pick(_section(raw, "backups"), BackupsConfig, "backups"))
+    backups.paths = [str(p).strip() for p in _as_list(backups.paths) if str(p).strip()]
+    for pattern in backups.paths:
+        if not _BACKUP_GLOB_RE.match(pattern):
+            raise ConfigError(f"backups.paths: {pattern!r} must be an absolute path using only letters, digits, "
+                              "and . _ - / * ? (no spaces or quotes)")
+    if backups.enabled and not backups.paths:
+        warnings.append("Backup check off: add at least one pattern under backups.paths")
+        backups.enabled = False
+    if backups.enabled and not (vps and vps.ssh):
+        warnings.append("Backup check off: it needs vps.ssh")
+        backups.enabled = False
+
     return Config(general=general, thresholds=thresholds, alerts=alerts, daily_report=daily,
-                  dashboard=dashboard, sites=sites, vps=vps, security=security, base_dir=base,
+                  dashboard=dashboard, sites=sites, vps=vps, security=security, heartbeat=heartbeat,
+                  monthly_report=monthly, status_page=status_page, backups=backups, base_dir=base,
                   warnings=warnings)

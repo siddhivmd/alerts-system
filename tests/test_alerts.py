@@ -98,6 +98,63 @@ def test_failed_delivery_is_retried_next_cycle(mgr, sid):
     assert run(mgr, sid, down(), T0 + 15 * MIN) == []
 
 
+def _outage(mgr, sid):
+    run(mgr, sid, down(), T0)
+    run(mgr, sid, down(), T0 + 5 * MIN)          # DOWN alert, incident open since T0
+
+
+def test_failed_recovery_alert_is_retried_until_delivered(mgr, sid, store):
+    _outage(mgr, sid)
+    assert run(mgr, sid, up(), T0 + 20 * MIN, delivered=False) == ["recovered"]  # email + Telegram failed
+    assert store.incidents()[0]["ended_at"] == T0 + 20 * MIN  # the incident itself is closed correctly
+    events = mgr.evaluate_site(sid, up(), T0 + 25 * MIN)      # next cycle: sent again
+    assert [e.kind for e in events] == ["recovered"]
+    assert events[0].duration == 20 * MIN and events[0].ts == T0 + 20 * MIN  # real downtime, not retry time
+    mgr.mark_sent(events)
+    assert run(mgr, sid, up(), T0 + 30 * MIN) == []          # delivered once -> never again
+
+
+def test_failed_recovery_alert_survives_restart(store, sid):
+    cfg = AlertsConfig(consecutive_failures=2)
+    _outage(AlertManager(store, cfg), sid)
+    run(AlertManager(store, cfg), sid, up(), T0 + 20 * MIN, delivered=False)
+    assert run(AlertManager(store, cfg), sid, up(), T0 + 25 * MIN) == ["recovered"]
+
+
+def test_undeliverable_recovery_alert_is_dropped_after_24h(mgr, sid, caplog):
+    _outage(mgr, sid)
+    run(mgr, sid, up(), T0 + 20 * MIN, delivered=False)
+    assert run(mgr, sid, up(), T0 + 20 * MIN + 23 * 3600, delivered=False) == ["recovered"]
+    assert run(mgr, sid, up(), T0 + 20 * MIN + 25 * 3600) == []
+    assert "Dropping undeliverable RECOVERED" in caplog.text
+
+
+def test_pending_recovery_dropped_when_site_goes_down_again(mgr, sid):
+    _outage(mgr, sid)
+    run(mgr, sid, up(), T0 + 20 * MIN, delivered=False)
+    assert run(mgr, sid, down(), T0 + 25 * MIN) == []          # blip: recovery still owed
+    assert run(mgr, sid, up(), T0 + 30 * MIN) == ["recovered"]
+    run(mgr, sid, down(), T0 + 35 * MIN, delivered=False)
+    assert run(mgr, sid, down(), T0 + 40 * MIN) == ["down"]   # new incident: the old "recovered" is now wrong
+    assert run(mgr, sid, down(), T0 + 45 * MIN) == []
+
+
+def test_recovery_retried_separately_for_escalation_contacts(store, sid):
+    from sitemonitor.config import EscalationConfig
+    mgr = AlertManager(store, AlertsConfig(consecutive_failures=1,
+                                           escalation=EscalationConfig(after_minutes=10, email_to=["boss@x"])))
+    run(mgr, sid, down(), T0)
+    mgr.mark_sent([e for e in mgr.evaluate_site(sid, down(), T0 + 10 * MIN) if e.kind == "escalation"],
+                  escalation=True)
+    [rec] = mgr.evaluate_site(sid, up(), T0 + 20 * MIN)
+    assert rec.notify_normal and rec.escalated
+    mgr.mark_sent([rec])                                        # team got it; escalation channel failed
+    [retry] = mgr.evaluate_site(sid, up(), T0 + 25 * MIN)
+    assert not retry.notify_normal and retry.escalated          # only the boss is still owed the message
+    mgr.mark_sent([retry], escalation=True)
+    assert mgr.evaluate_site(sid, up(), T0 + 30 * MIN) == []
+
+
 def test_state_survives_restart(store, sid):
     cfg = AlertsConfig(consecutive_failures=2, throttle_minutes=30)
     run(AlertManager(store, cfg), sid, down(), T0)

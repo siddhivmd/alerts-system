@@ -18,6 +18,7 @@ from typing import Any, Callable
 import requests
 
 from .config import SiteConfig, VpsConfig
+from .pagetext import defacement_match, page_words
 
 log = logging.getLogger(__name__)
 
@@ -63,6 +64,8 @@ class SiteCheckResult:
     keyword: str | None = None
     keyword_found: bool | None = None
     forbidden_found: list[str] = field(default_factory=list)
+    page_words: list[str] | None = None  # for defacement detection (not stored in history)
+    defacement_text: str | None = None
 
     ssl_checked: bool = False
     ssl_days_left: int | None = None
@@ -80,7 +83,9 @@ class SiteCheckResult:
         return self.http_status is not None
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        d.pop("page_words", None)  # large; only needed in memory
+        return d
 
 
 @dataclass
@@ -297,6 +302,9 @@ def _http_check(site: SiteConfig, result: SiteCheckResult, user_agent: str) -> N
     if site.keyword:
         result.keyword_found = site.keyword in text
     result.forbidden_found = [k for k in site.forbidden_keywords if k in text]
+    result.defacement_text = defacement_match(text)
+    if site.content_change_alert > 0 and result.status_ok:
+        result.page_words = page_words(text)
 
 
 def _short(exc: BaseException, limit: int = 300) -> str:

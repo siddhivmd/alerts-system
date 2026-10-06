@@ -105,6 +105,18 @@ class SiteState:
     incident_id: int | None = None
     last_alert_at: float | None = None
     last_alert_cause: str | None = None
+    escalated_at: float | None = None  # when the current incident was escalated (once per incident)
+    # Closed incident whose RECOVERED message has not been delivered yet (retried every cycle):
+    recovery_pending: int | None = None             # ... to the normal alert recipients
+    recovery_pending_escalation: int | None = None  # ... to the escalation contacts
+
+
+# Columns added after the first release: (table, column, SQL type). Applied on startup.
+MIGRATIONS = [
+    ("site_state", "escalated_at", "REAL"),
+    ("site_state", "recovery_pending", "INTEGER"),
+    ("site_state", "recovery_pending_escalation", "INTEGER"),
+]
 
 
 class Storage:
@@ -123,6 +135,10 @@ class Storage:
             if path != ":memory:":
                 conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(SCHEMA)
+            for table, column, sql_type in MIGRATIONS:  # upgrade databases created by older versions
+                existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
@@ -181,15 +197,16 @@ class Storage:
                 WHERE c.ts >= ? ORDER BY c.ts""", (since,)).fetchall()
         return [dict(r) for r in rows]
 
-    def site_summary(self, since: float) -> dict[int, dict[str, Any]]:
-        """Uptime % (up+warning / total) and average response time per site since ``since``."""
+    def site_summary(self, since: float, until: float | None = None) -> dict[int, dict[str, Any]]:
+        """Uptime % (up+warning / total) and average response time per site in [since, until)."""
         with self._conn() as conn:
             rows = conn.execute("""
                 SELECT site_id, COUNT(*) AS total,
                        SUM(CASE WHEN status != 'down' THEN 1 ELSE 0 END) AS ok,
                        AVG(CASE WHEN status != 'down' THEN response_ms END) AS avg_ms,
                        MAX(response_ms) AS max_ms
-                FROM checks WHERE ts >= ? GROUP BY site_id""", (since,)).fetchall()
+                FROM checks WHERE ts >= ? AND ts < ? GROUP BY site_id""",
+                (since, until if until is not None else float("inf"))).fetchall()
         out: dict[int, dict[str, Any]] = {}
         for r in rows:
             out[r["site_id"]] = {
@@ -200,7 +217,28 @@ class Storage:
             }
         return out
 
+    def daily_uptime(self, since: float, utc_offset_seconds: float = 0) -> dict[int, dict[int, float]]:
+        """{site_id: {day_number: uptime %}}; day_number = local days since the epoch."""
+        with self._conn() as conn:
+            rows = conn.execute("""
+                SELECT site_id, CAST((ts + ?) / 86400 AS INTEGER) AS day, COUNT(*) AS total,
+                       SUM(CASE WHEN status != 'down' THEN 1 ELSE 0 END) AS ok
+                FROM checks WHERE ts >= ? GROUP BY site_id, day""", (utc_offset_seconds, since)).fetchall()
+        out: dict[int, dict[int, float]] = {}
+        for r in rows:
+            out.setdefault(r["site_id"], {})[r["day"]] = round(100.0 * r["ok"] / r["total"], 2)
+        return out
+
     # ------------------------------------------------------------------ incidents
+    def incidents_between(self, start: float, end: float) -> list[dict[str, Any]]:
+        """Incidents that overlap [start, end), including ones still open."""
+        with self._conn() as conn:
+            rows = conn.execute("""
+                SELECT i.*, s.name AS site_name FROM incidents i JOIN sites s ON s.id = i.site_id
+                WHERE i.started_at < ? AND (i.ended_at IS NULL OR i.ended_at >= ?)
+                ORDER BY i.started_at""", (end, start)).fetchall()
+        return [_row(r, json_fields=("details",)) for r in rows]
+
     def open_incident(self, site_id: int, started_at: float, cause_code: str, cause: str,
                       details: dict[str, Any]) -> int:
         with self._conn() as conn:
@@ -244,16 +282,21 @@ class Storage:
         with self._conn() as conn:
             conn.execute("""
                 INSERT INTO site_state(site_id, consecutive_failures, first_failure_at, incident_id,
-                                       last_alert_at, last_alert_cause)
-                VALUES (?,?,?,?,?,?)
+                                       last_alert_at, last_alert_cause, escalated_at,
+                                       recovery_pending, recovery_pending_escalation)
+                VALUES (?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(site_id) DO UPDATE SET
+                    escalated_at=excluded.escalated_at,
                     consecutive_failures=excluded.consecutive_failures,
                     first_failure_at=excluded.first_failure_at,
                     incident_id=excluded.incident_id,
                     last_alert_at=excluded.last_alert_at,
-                    last_alert_cause=excluded.last_alert_cause""",
+                    last_alert_cause=excluded.last_alert_cause,
+                    recovery_pending=excluded.recovery_pending,
+                    recovery_pending_escalation=excluded.recovery_pending_escalation""",
                 (state.site_id, state.consecutive_failures, state.first_failure_at, state.incident_id,
-                 state.last_alert_at, state.last_alert_cause))
+                 state.last_alert_at, state.last_alert_cause, state.escalated_at,
+                 state.recovery_pending, state.recovery_pending_escalation))
 
     def touch_warning(self, key: str, code: str, ts: float) -> tuple[int, float | None]:
         """Record that a warning is active this cycle. Returns (consecutive sightings, last_sent_at)."""
@@ -311,6 +354,15 @@ class Storage:
         with self._conn() as conn:
             r = conn.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
         return json.loads(r["value"]) if r else None
+
+    def delete_kv(self, key: str) -> None:
+        with self._conn() as conn:
+            conn.execute("DELETE FROM kv WHERE key=?", (key,))
+
+    def delete_kv_prefix(self, prefix: str) -> int:
+        with self._conn() as conn:
+            return conn.execute("DELETE FROM kv WHERE key LIKE ? ESCAPE '\\'",
+                                (prefix.replace("%", "\\%").replace("_", "\\_") + "%",)).rowcount
 
     # ------------------------------------------------------------------ WHOIS cache
     def get_whois(self, domain: str) -> dict[str, Any] | None:

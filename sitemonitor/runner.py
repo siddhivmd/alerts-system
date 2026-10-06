@@ -8,10 +8,13 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
-from .alerts import AlertEvent, AlertManager, Notifier
+from . import content, maintenance
+from .alerts import AlertEvent, AlertManager, Notifier, escalation_notifier
+from .backups import backup_summary, backup_warnings
 from .checks import SiteCheckResult, VpsReachability, WhoisLookup, check_site, check_vps_ports
 from .config import Config, SiteConfig
 from .diagnosis import DOWN, UP, WARNING, Diagnosis, Warn, diagnose, is_failing, vps_warnings
+from .heartbeat import Heartbeat
 from .security import SecurityChecker
 from .ssh_stats import VpsStats, collect_stats, fetch_error_logs
 from .storage import Storage
@@ -31,6 +34,7 @@ class CycleResult:
     security: dict[str, Any] = field(default_factory=dict)  # human-readable security status
     events: list[AlertEvent] = field(default_factory=list)
     alerts_delivered: bool | None = None
+    maintenance: dict[str, Any] | None = None  # active maintenance window, if any
     duration: float = 0.0
 
     @property
@@ -58,7 +62,9 @@ class Monitor:
         self.whois = WhoisLookup(storage)
         self.alerts = AlertManager(storage, cfg.alerts)
         self.notifier = notifier or Notifier(cfg.alerts, cfg.general.timezone)
+        self.escalation_notifier = escalation_notifier(cfg.alerts, cfg.general.timezone)
         self.security = SecurityChecker(cfg)
+        self.heartbeat = Heartbeat(cfg.heartbeat)
         # Alert key for server-level warnings (works even without a VPS, e.g. security.extra_ips).
         self.server_key = cfg.vps.name if cfg.vps else "Server"
         self.last_cycle: CycleResult | None = None
@@ -71,9 +77,18 @@ class Monitor:
             log.warning("Previous check cycle still running; skipping this one")
             return self.last_cycle or CycleResult(ts=time.time(), results=[], diagnoses=[])
         try:
-            return self._run(save=save or alert, alert=alert, only=only)
+            cycle = self._run(save=save or alert, alert=alert, only=only)
+        except Exception as exc:
+            if alert:  # scheduled cycle crashed: tell the watchdog right away
+                self.heartbeat.ping(ok=False, message=f"Check cycle crashed: {type(exc).__name__}: {exc}")
+            raise
         finally:
             self._cycle_lock.release()
+        if alert:  # only real (scheduled / --alert) cycles count as "alive"
+            up = sum(d.status != DOWN for d in cycle.diagnoses)
+            self.heartbeat.ping(ok=True, message=f"{up} up, {len(cycle.down)} down, "
+                                                 f"{len(cycle.events)} alert event(s)")
+        return cycle
 
     # ------------------------------------------------------------------ internals
     def _run(self, save: bool, alert: bool, only: list[str] | None) -> CycleResult:
@@ -84,7 +99,8 @@ class Monitor:
 
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="check") as ex:
             reach_f = ex.submit(check_vps_ports, vps) if vps else None
-            stats_f = ex.submit(collect_stats, vps.host, vps.ssh, self.cfg.security) if vps and vps.ssh else None
+            stats_f = (ex.submit(collect_stats, vps.host, vps.ssh, self.cfg.security, self.cfg.backups)
+                       if vps and vps.ssh else None)
             security_f = ex.submit(self.security.refresh, started)  # blacklists / Safe Browsing (cached)
             site_fs = [(s, ex.submit(check_site, s, self.whois, self.cfg.general.user_agent)) for s in sites]
             results = []
@@ -120,6 +136,12 @@ class Monitor:
             security_status = self.security.summary()
         except Exception:  # noqa: BLE001 - security checks must never break the site checks
             log.exception("Security evaluation failed")
+        try:
+            vps_warns += backup_warnings(stats, self.cfg.backups)
+            security_status["backups"] = backup_summary(stats, self.cfg.backups)
+        except Exception:  # noqa: BLE001
+            log.exception("Backup check failed")
+        self._check_content(sites, results, diagnoses, save)
 
         cycle = CycleResult(ts=started, results=results, diagnoses=diagnoses, reach=reach, stats=stats,
                             vps_warnings=vps_warns, security=security_status)
@@ -132,6 +154,25 @@ class Monitor:
         log.info("Cycle done in %.1fs: %d site(s), %d down, %d alert event(s)",
                  cycle.duration, len(results), len(cycle.down), len(cycle.events))
         return cycle
+
+    def _check_content(self, sites: list[SiteConfig], results: list[SiteCheckResult],
+                       diagnoses: list[Diagnosis], save: bool) -> None:
+        """Defacement detection on every page that loaded fine. Never raises."""
+        by_name = {s.name: s for s in sites}
+        for r, d in zip(results, diagnoses):
+            site = by_name.get(r.site)
+            if site is None or d.status == DOWN:
+                continue
+            try:
+                extra = content.check_content(self.storage, site, r.page_words, r.defacement_text, save=save,
+                                              now=r.ts)
+            except Exception:  # noqa: BLE001
+                log.exception("Content check failed for %s", r.site)
+                continue
+            if extra:
+                d.warnings += extra
+                if d.status == UP:
+                    d.status = WARNING
 
     def _error_logs(self, sites: list[SiteConfig], results: list[SiteCheckResult],
                     reach: VpsReachability | None, stats: VpsStats | None) -> dict[str, list[str]]:
@@ -189,23 +230,43 @@ class Monitor:
 
     def _alert(self, cycle: CycleResult) -> None:
         events: list[AlertEvent] = []
+        window = maintenance.active(self.storage, cycle.ts)
+        cycle.maintenance = window
         try:
             for d in cycle.diagnoses:
                 site_id = self.site_ids.get(d.site)
-                if site_id is None:
-                    continue
+                if site_id is None or maintenance.mutes(window, d.site):
+                    continue  # maintenance: alert state is frozen, nothing is sent
                 events += self.alerts.evaluate_site(site_id, d, cycle.ts)
                 if d.status != DOWN:  # a DOWN alert already lists everything that matters
                     events += self.alerts.evaluate_warnings(d.site, d.warnings, cycle.ts)
-            events += self.alerts.evaluate_warnings(self.server_key, cycle.vps_warnings, cycle.ts)
+            if not maintenance.mutes(window, None):
+                events += self.alerts.evaluate_warnings(self.server_key, cycle.vps_warnings, cycle.ts)
         except Exception:  # noqa: BLE001
             log.exception("Alert evaluation failed")
+        if window:
+            log.info("Maintenance mode until %s: alerts paused for %s", time.strftime(
+                "%H:%M", time.localtime(window["until"])), ", ".join(window["sites"]) or "all sites")
         cycle.events = events
-        if not events:
-            return
-        cycle.alerts_delivered = self.notifier.dispatch(events)
-        if cycle.alerts_delivered:
-            try:
-                self.alerts.mark_sent(events)
-            except Exception:  # noqa: BLE001
-                log.exception("Recording sent alerts failed")
+
+        # A retried RECOVERED message may only be owed to the escalation contacts.
+        normal = [e for e in events if e.kind != "escalation" and not (e.kind == "recovered" and not e.notify_normal)]
+        if normal:
+            cycle.alerts_delivered = self.notifier.dispatch(normal)
+            if cycle.alerts_delivered:
+                self._mark_sent(normal)
+
+        # Escalation contacts get the escalation itself and, optionally, the recovery.
+        esc_cfg = self.cfg.alerts.escalation
+        escalations = [e for e in events if e.kind == "escalation"]
+        recoveries = [e for e in events if e.kind == "recovered" and e.escalated] \
+            if esc_cfg and esc_cfg.notify_recovery else []
+        if self.escalation_notifier and (escalations or recoveries):
+            if self.escalation_notifier.dispatch(escalations + recoveries):
+                self._mark_sent(escalations + recoveries, escalation=True)
+
+    def _mark_sent(self, events: list[AlertEvent], escalation: bool = False) -> None:
+        try:
+            self.alerts.mark_sent(events, escalation=escalation)
+        except Exception:  # noqa: BLE001
+            log.exception("Recording sent alerts failed")

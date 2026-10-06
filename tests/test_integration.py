@@ -150,7 +150,7 @@ def monitor(cfg, monkeypatch):
     monkeypatch.setattr(runner_mod, "check_site", fake_check_site)
     monkeypatch.setattr(runner_mod, "check_vps_ports", lambda vps: reach(p22=True, p80=True, p443=True))
     stats = healthy_stats(services={"nginx": {"active": "failed", "sub": "failed", "enabled": "enabled"}})
-    monkeypatch.setattr(runner_mod, "collect_stats", lambda host, ssh, security=None: stats)
+    monkeypatch.setattr(runner_mod, "collect_stats", lambda host, ssh, security=None, backups=None: stats)
     monkeypatch.setattr(runner_mod, "fetch_error_logs",
                         lambda host, ssh, paths: {"/var/log/nginx/error.log": ["[emerg] bind() failed"]})
     cfg.security.blacklist_check = False  # no real DNS lookups in tests (covered in test_security.py)
@@ -180,6 +180,27 @@ def test_full_cycle_diagnoses_alerts_and_recovers(monitor):
     incidents = monitor.storage.incidents()
     assert {i["site_name"] for i in incidents} == {"A", "B"}
     assert next(i for i in incidents if i["site_name"] == "A")["ended_at"] is not None
+
+
+def test_recovery_alert_resent_after_all_channels_failed(monitor):
+    """Regression: a RECOVERED alert lost to an email/Telegram outage used to be gone for good."""
+    class Flaky(Recorder):
+        working = True
+
+        def dispatch(self, events):
+            self.batches.append(events)
+            return self.working
+
+    monitor.notifier = Flaky()
+    monitor.test_state["a_down"] = True
+    monitor.run_cycle()
+    monitor.run_cycle()                                         # DOWN alert delivered
+    monitor.test_state["a_down"] = False
+    monitor.notifier.working = False                            # every channel fails at recovery time
+    assert ("recovered", "A") in {(e.kind, e.key) for e in monitor.run_cycle().events}
+    monitor.notifier.working = True
+    assert ("recovered", "A") in {(e.kind, e.key) for e in monitor.run_cycle().events}  # retried
+    assert ("recovered", "A") not in {(e.kind, e.key) for e in monitor.run_cycle().events}  # and only once
 
 
 def test_dashboard_requires_auth_and_serves_status(cfg, monitor):

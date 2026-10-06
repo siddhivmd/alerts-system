@@ -7,29 +7,35 @@ Rules
 * While it stays down, the same cause is re-alerted at most once per
   ``throttle_minutes``. A *different* cause alerts immediately.
 * The first successful check closes the incident and sends RECOVERED with the
-  downtime (measured from the first failed check).
+  downtime (measured from the first failed check). If that message cannot be
+  delivered, it stays pending and is retried every cycle (for up to
+  ``RECOVERY_RETRY_HOURS``) until a channel accepts it.
 * Warnings (SSL/domain expiry, slow, VPS health) also need ``consecutive_failures``
   sightings and then repeat at most every ``warning_repeat_hours``.
 * All events from one cycle go out as ONE message per channel, so a VPS outage
   with 20 sites produces one email, not twenty.
 * "Last alerted" is only recorded after at least one channel delivered the
   message; if every channel fails, the next cycle retries.
+* Escalation (optional): if an incident is still open after ``after_minutes``,
+  a separate list of people gets ONE "escalation" alert, and (optionally) a
+  recovery message later. It is recorded per incident, so it never repeats.
 """
 from __future__ import annotations
 
 import logging
+import re
 import smtplib
 import ssl
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from email.message import EmailMessage
-from typing import Protocol
+from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
 import requests
 
-from .config import AlertsConfig, EmailConfig, TelegramConfig
+from .config import AlertsConfig, EmailConfig, TelegramConfig, WhatsAppConfig
 from .diagnosis import DOWN, Diagnosis, Warn
 from .storage import Storage
 
@@ -37,11 +43,13 @@ log = logging.getLogger(__name__)
 
 DOWN_KINDS = ("down", "cause_changed", "still_down")
 TELEGRAM_LIMIT = 4000
+WHATSAPP_LIMIT = 1500  # Twilio allows 1600 characters per WhatsApp message
+RECOVERY_RETRY_HOURS = 24  # after this, an undeliverable RECOVERED message is dropped (and logged)
 
 
 @dataclass
 class AlertEvent:
-    kind: str                     # down | cause_changed | still_down | recovered | warning
+    kind: str                     # down | cause_changed | still_down | recovered | warning | escalation
     key: str                      # site name, or the VPS name for server warnings
     ts: float
     site_id: int | None = None
@@ -51,6 +59,9 @@ class AlertEvent:
     started_at: float | None = None
     duration: float | None = None  # seconds down (recovered) or down so far (still_down)
     cause: str | None = None       # for recovered: what the cause was
+    incident_id: int | None = None  # for recovered: which incident it closes (clears the pending flag)
+    notify_normal: bool = True     # for recovered: still owed to the normal alert recipients
+    escalated: bool = False        # for recovered: still owed to the escalation contacts
 
 
 # --------------------------------------------------------------------------- decision logic
@@ -77,6 +88,8 @@ class AlertManager:
                     state.incident_id = self.storage.open_incident(
                         site_id, state.first_failure_at, diag.cause_code or "unknown", diag.cause, diag.to_dict())
                     kind = "down"
+                    # A RECOVERED message still owed for the previous outage is now wrong: drop it.
+                    state.recovery_pending = state.recovery_pending_escalation = None
                 elif state.last_alert_cause is None:
                     kind = "down"  # the first DOWN alert was never delivered: retry
                 elif state.last_alert_cause != diag.cause_code:
@@ -88,15 +101,23 @@ class AlertManager:
                     events.append(AlertEvent(kind=kind, key=diag.site, ts=ts, site_id=site_id, url=diag.url,
                                              diagnosis=diag, started_at=state.first_failure_at,
                                              duration=ts - state.first_failure_at))
+                esc = self.cfg.escalation
+                if esc and state.escalated_at is None and ts - state.first_failure_at >= esc.after_minutes * 60:
+                    events.append(AlertEvent(kind="escalation", key=diag.site, ts=ts, site_id=site_id, url=diag.url,
+                                             diagnosis=diag, started_at=state.first_failure_at,
+                                             duration=ts - state.first_failure_at))
         else:
             if state.incident_id is not None:
-                incident = self.storage.get_incident(state.incident_id)
+                # Close the incident now (the site IS back), but only mark the RECOVERED message as
+                # owed. mark_sent() clears it once a channel accepts it; until then it is re-sent.
                 self.storage.close_incident(state.incident_id, ts)
-                started = incident["started_at"] if incident else state.first_failure_at or ts
-                events.append(AlertEvent(kind="recovered", key=diag.site, ts=ts, site_id=site_id, url=diag.url,
-                                         diagnosis=diag, started_at=started, duration=ts - started,
-                                         cause=incident["cause"] if incident else None))
+                state.recovery_pending = state.incident_id
+                esc = self.cfg.escalation
+                if esc and esc.notify_recovery and state.escalated_at is not None:
+                    state.recovery_pending_escalation = state.incident_id
+            events += self._pending_recovery(site_id, diag, state, ts)
             state.consecutive_failures = 0
+            state.escalated_at = None
             state.first_failure_at = None
             state.incident_id = None
             state.last_alert_at = None
@@ -104,6 +125,24 @@ class AlertManager:
 
         self.storage.save_state(state)
         return events
+
+    def _pending_recovery(self, site_id: int, diag: Diagnosis, state: Any, ts: float) -> list[AlertEvent]:
+        """RECOVERED message for a closed incident that has not been delivered yet (first try or retry)."""
+        incident_id = state.recovery_pending or state.recovery_pending_escalation
+        if incident_id is None:
+            return []
+        incident = self.storage.get_incident(incident_id)
+        ended = (incident or {}).get("ended_at")
+        if incident is None or ended is None or ts - ended > RECOVERY_RETRY_HOURS * 3600:
+            log.warning("Dropping undeliverable RECOVERED alert for %s (incident %s): no channel accepted it "
+                        "within %d h", diag.site, incident_id, RECOVERY_RETRY_HOURS)
+            state.recovery_pending = state.recovery_pending_escalation = None
+            return []
+        started = incident["started_at"]
+        return [AlertEvent(kind="recovered", key=diag.site, ts=ended, site_id=site_id, url=diag.url,
+                           diagnosis=diag, started_at=started, duration=ended - started, cause=incident["cause"],
+                           incident_id=incident_id, notify_normal=state.recovery_pending == incident_id,
+                           escalated=state.recovery_pending_escalation == incident_id)]
 
     def evaluate_warnings(self, key: str, warnings: list[Warn], ts: float) -> list[AlertEvent]:
         """Warnings for a site (or the VPS). Warnings no longer present are forgotten."""
@@ -117,13 +156,28 @@ class AlertManager:
         self.storage.clear_warnings(key, {w.code for w in warnings})
         return events
 
-    def mark_sent(self, events: list[AlertEvent]) -> None:
-        """Record successful delivery (drives throttling)."""
+    def mark_sent(self, events: list[AlertEvent], escalation: bool = False) -> None:
+        """Record successful delivery (drives throttling and retries).
+
+        ``escalation=True`` means the events went to the escalation contacts.
+        """
         for ev in events:
+            if ev.kind == "recovered" and ev.site_id is not None:
+                state = self.storage.get_state(ev.site_id)
+                if escalation and state.recovery_pending_escalation == ev.incident_id:
+                    state.recovery_pending_escalation = None
+                elif not escalation and state.recovery_pending == ev.incident_id:
+                    state.recovery_pending = None
+                self.storage.save_state(state)
+                continue
             if ev.kind in DOWN_KINDS and ev.site_id is not None and ev.diagnosis is not None:
                 state = self.storage.get_state(ev.site_id)
                 state.last_alert_at = ev.ts
                 state.last_alert_cause = ev.diagnosis.cause_code
+                self.storage.save_state(state)
+            elif ev.kind == "escalation" and ev.site_id is not None:
+                state = self.storage.get_state(ev.site_id)
+                state.escalated_at = ev.ts
                 self.storage.save_state(state)
             elif ev.kind == "warning" and ev.warning is not None:
                 self.storage.mark_warning_sent(ev.key, ev.warning.code, ev.ts)
@@ -161,6 +215,10 @@ class Formatter:
         return datetime.fromtimestamp(ts, tz=self.tz).strftime("%Y-%m-%d %H:%M %Z")
 
     def subject(self, events: list[AlertEvent]) -> str:
+        esc = [e for e in events if e.kind == "escalation"]
+        if esc:
+            longest = max(e.duration or 0 for e in esc)
+            return f"[ESCALATION] Still down after {format_duration(longest)}: {', '.join(e.key for e in esc)}"
         down = [e.key for e in events if e.kind in DOWN_KINDS]
         rec = [e.key for e in events if e.kind == "recovered"]
         warn = sorted({e.key for e in events if e.kind == "warning"})
@@ -194,6 +252,14 @@ class Formatter:
             if d.error_log and full:
                 lines.append("Last web server error log lines:")
                 lines += [f"    {line}" for line in d.error_log]
+        elif ev.kind == "escalation" and d is not None:
+            lines.append(f"🚨 ESCALATED: {ev.key} has been down for {format_duration(ev.duration)} "
+                         f"and is not fixed yet  {ev.url}")
+            lines.append(f"Cause: {d.cause}")
+            lines.append(f"Down since: {self.when(ev.started_at)}")
+            if d.fixes:
+                lines.append("Suggested fix:")
+                lines += [f"  - {f}" for f in (d.fixes if full else d.fixes[:2])]
         elif ev.kind == "recovered":
             lines.append(f"✅ RECOVERED: {ev.key}  {ev.url}")
             lines.append(f"Downtime: {format_duration(ev.duration)} "
@@ -211,7 +277,7 @@ class Formatter:
         return "\n".join(lines)
 
     def body(self, events: list[AlertEvent], full: bool = True) -> str:
-        order = {"down": 0, "cause_changed": 0, "still_down": 1, "recovered": 2, "warning": 3}
+        order = {"escalation": 0, "down": 0, "cause_changed": 0, "still_down": 1, "recovered": 2, "warning": 3}
         events = sorted(events, key=lambda e: (order.get(e.kind, 9), e.key))
         header = f"Site monitor report - {self.when(time.time())}"
         return header + "\n\n" + "\n\n".join(self.event(e, full) for e in events)
@@ -277,6 +343,87 @@ class TelegramChannel:
             raise RuntimeError("; ".join(errors))
 
 
+def whatsapp_text(subject: str, text: str, limit: int = WHATSAPP_LIMIT) -> str:
+    """Short WhatsApp message: subject + body, trimmed to the provider limit."""
+    message = f"{subject}\n\n{text}".strip()
+    return message if len(message) <= limit else message[:limit - 20].rstrip() + "\n...(truncated)"
+
+
+def flatten_for_template(text: str, limit: int = 1000) -> str:
+    """Meta template parameters may not contain newlines, tabs or 4+ spaces in a row."""
+    flat = re.sub(r"\s*\n\s*", " | ", text.strip())
+    flat = re.sub(r"[\t ]{2,}", " ", flat)
+    return flat if len(flat) <= limit else flat[:limit - 3] + "..."
+
+
+class WhatsAppChannel:
+    """WhatsApp alerts via Twilio or Meta's WhatsApp Cloud API.
+
+    Note: WhatsApp only allows free-form messages to someone who messaged you in
+    the last 24 hours. For alerts at any time, Meta needs an approved *template*
+    (set alerts.whatsapp.template); Twilio's sandbox allows free-form text to
+    numbers that joined the sandbox.
+    """
+
+    name = "whatsapp"
+
+    def __init__(self, cfg: WhatsAppConfig, post=None) -> None:
+        self.cfg = cfg
+        self._post = post or requests.post
+
+    def _secrets(self) -> list[str]:
+        return [s for s in (self.cfg.auth_token, self.cfg.access_token, self.cfg.account_sid) if s]
+
+    def _mask(self, text: str) -> str:
+        for secret in self._secrets():
+            text = text.replace(secret, "***")
+        return text
+
+    def _send_twilio(self, number: str, message: str) -> None:
+        url = f"https://api.twilio.com/2010-04-01/Accounts/{self.cfg.account_sid}/Messages.json"
+        resp = self._post(url, data={"From": f"whatsapp:{self.cfg.from_number}", "To": f"whatsapp:{number}",
+                                     "Body": message},
+                          auth=(self.cfg.account_sid, self.cfg.auth_token), timeout=self.cfg.timeout)
+        if resp.status_code >= 300:
+            try:
+                detail = resp.json().get("message", resp.text[:200])
+            except ValueError:
+                detail = resp.text[:200]
+            raise RuntimeError(f"Twilio error {resp.status_code}: {detail}")
+
+    def _send_meta(self, number: str, message: str) -> None:
+        url = f"https://graph.facebook.com/v20.0/{self.cfg.phone_number_id}/messages"
+        to = number.lstrip("+")
+        if self.cfg.template:
+            payload = {"messaging_product": "whatsapp", "to": to, "type": "template",
+                       "template": {"name": self.cfg.template, "language": {"code": self.cfg.template_language},
+                                    "components": [{"type": "body", "parameters": [
+                                        {"type": "text", "text": flatten_for_template(message)}]}]}}
+        else:
+            payload = {"messaging_product": "whatsapp", "to": to, "type": "text",
+                       "text": {"body": message, "preview_url": False}}
+        resp = self._post(url, json=payload, headers={"Authorization": f"Bearer {self.cfg.access_token}"},
+                          timeout=self.cfg.timeout)
+        if resp.status_code >= 300:
+            try:
+                detail = (resp.json().get("error") or {}).get("message", resp.text[:200])
+            except ValueError:
+                detail = resp.text[:200]
+            raise RuntimeError(f"WhatsApp Cloud API error {resp.status_code}: {detail}")
+
+    def send(self, subject: str, text: str) -> None:
+        message = whatsapp_text(subject, text)
+        sender = self._send_twilio if self.cfg.provider == "twilio" else self._send_meta
+        errors = []
+        for number in self.cfg.to:
+            try:
+                sender(number, message)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{number}: {self._mask(str(exc) or type(exc).__name__)}")
+        if errors:
+            raise RuntimeError("; ".join(errors))
+
+
 class ConsoleChannel:
     """Writes alerts to the log (and console). Lets you see real alert text without SMTP/Telegram."""
 
@@ -296,6 +443,8 @@ class Notifier:
                 channels.append(EmailChannel(cfg.email))
             if cfg.telegram:
                 channels.append(TelegramChannel(cfg.telegram))
+            if cfg.whatsapp:
+                channels.append(WhatsAppChannel(cfg.whatsapp))
         self.channels = channels
         self.fmt = Formatter(tz_name)
 
@@ -333,3 +482,27 @@ class Notifier:
         if not self.channels:
             return {}
         return self.send("[TEST] Site monitor alert test", text)
+
+
+def escalation_notifier(cfg: AlertsConfig, tz_name: str = "UTC") -> Notifier | None:
+    """A Notifier that reuses the configured channels but sends to the escalation contacts."""
+    esc = cfg.escalation
+    if esc is None:
+        return None
+    channels: list[Channel] = [ConsoleChannel()] if cfg.console else []
+    if esc.email_to:
+        if cfg.email:
+            channels.append(EmailChannel(replace(cfg.email, to=esc.email_to)))
+        else:
+            log.warning("Escalation email_to is set but email alerts are not configured")
+    if esc.telegram_chat_ids:
+        if cfg.telegram:
+            channels.append(TelegramChannel(replace(cfg.telegram, chat_ids=esc.telegram_chat_ids)))
+        else:
+            log.warning("Escalation telegram_chat_ids is set but Telegram alerts are not configured")
+    if esc.whatsapp_to:
+        if cfg.whatsapp:
+            channels.append(WhatsAppChannel(replace(cfg.whatsapp, to=esc.whatsapp_to)))
+        else:
+            log.warning("Escalation whatsapp_to is set but WhatsApp alerts are not configured")
+    return Notifier(cfg, tz_name, channels)

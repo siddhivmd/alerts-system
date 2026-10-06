@@ -17,7 +17,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .config import SecurityConfig, SshConfig
+from .config import BackupsConfig, SecurityConfig, SshConfig
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +55,7 @@ class VpsStats:
     failed_ssh_window: str = "last hour"
     failed_ssh_top_ips: list[tuple[str, int]] = field(default_factory=list)
     outbound_smtp: int | None = None
+    backups: dict[str, list[dict[str, Any]]] = field(default_factory=dict)  # pattern -> [{mtime, size, path}]
 
     # ---- derived views used by the diagnosis engine
     @property
@@ -112,12 +113,25 @@ echo '##SMTPOUT'; ss -tn state established '( dport = :25 or dport = :465 or dpo
 """
 
 
-def _stats_script(cfg: SshConfig, security: SecurityConfig | None = None) -> str:
+def _backups_script(backups: BackupsConfig, sudo: str) -> str:
+    """List the 3 newest files per pattern as 'mtime size path'. Patterns are validated in config.py
+    (absolute, only [A-Za-z0-9_./*?-]), so they can be left unquoted for the shell to expand."""
+    lines = ["echo '##BACKUPS'"]
+    for pattern in backups.paths:
+        lines.append(f"echo {shlex.quote('@@ ' + pattern)}")
+        lines.append(f"for f in {pattern}; do [ -f \"$f\" ] && {sudo}stat -c '%Y %s %n' \"$f\"; done "
+                     "2>/dev/null | sort -n | tail -n 3")
+    return "\n".join(lines) + "\n"
+
+
+def _stats_script(cfg: SshConfig, security: SecurityConfig | None = None,
+                  backups: BackupsConfig | None = None) -> str:
     sudo = "sudo -n " if cfg.use_sudo else ""
     pm2 = "command -v pm2 >/dev/null 2>&1 && pm2 jlist 2>/dev/null" if cfg.check_pm2 else ":"
     docker = (f"command -v docker >/dev/null 2>&1 && {sudo}docker ps -a "
               "--format '{{.Names}}|{{.State}}|{{.Status}}' 2>/dev/null") if cfg.check_docker_containers else ":"
     sec = _security_script(security, sudo) if security is not None and security.enabled else ""
+    sec += _backups_script(backups, sudo) if backups is not None and backups.enabled else ""
     return f"""export LC_ALL=C
 echo '##MEM'; grep -E '^(MemTotal|MemAvailable|SwapTotal|SwapFree):' /proc/meminfo
 echo '##LOAD'; cat /proc/loadavg; nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo
@@ -269,6 +283,20 @@ def _parse_security(s: dict[str, list[str]], st: VpsStats) -> None:
     if smtp and smtp[0].isdigit():
         st.outbound_smtp = int(smtp[0])
 
+    pattern: str | None = None
+    for line in s.get("BACKUPS", []):
+        if line.startswith("@@ "):
+            pattern = line[3:]
+            st.backups[pattern] = []
+            continue
+        parts = line.split(" ", 2)
+        if pattern is None or len(parts) < 3:
+            continue
+        try:
+            st.backups[pattern].append({"mtime": float(parts[0]), "size": int(parts[1]), "path": parts[2]})
+        except ValueError:
+            continue
+
 
 # --------------------------------------------------------------------------- SSH plumbing
 
@@ -306,7 +334,8 @@ def _friendly_error(exc: Exception) -> str:
     return f"SSH failed: {name}: {exc}"
 
 
-def collect_stats(host: str, cfg: SshConfig, security: SecurityConfig | None = None) -> VpsStats:
+def collect_stats(host: str, cfg: SshConfig, security: SecurityConfig | None = None,
+                  backups: BackupsConfig | None = None) -> VpsStats:
     """Collect all VPS metrics (plus security data if enabled) in one SSH session. Never raises."""
     try:
         client = _connect(host, cfg)
@@ -314,7 +343,7 @@ def collect_stats(host: str, cfg: SshConfig, security: SecurityConfig | None = N
         log.warning("SSH connect to %s failed: %s", host, exc)
         return VpsStats(ok=False, error=_friendly_error(exc))
     try:
-        output = _run(client, _stats_script(cfg, security), timeout=cfg.timeout * 3)
+        output = _run(client, _stats_script(cfg, security, backups), timeout=cfg.timeout * 3)
         return parse_stats(output, cfg.services)
     except Exception as exc:  # noqa: BLE001
         log.warning("Collecting stats from %s failed: %s", host, exc)
